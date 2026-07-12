@@ -1,14 +1,9 @@
-# Stage 1 (build-only) fuer eegfaktura-master — das prod-Backend
-# (go.mod-Modul at.ourproject/vfeeg-backend, Binary `vfeeg-backend`).
-#
-# Baut den selbst-enthaltenen Dockerfile (Go 1.25 + protoc + go generate).
-# PR-Events bauen nur (kein Push, fork-sicher); Push auf den Default-Branch
-# baut + pusht nach ghcr.io/<repo>.
-#
-# Bewusst NICHT dabei (spaetere Stufen):
-#   - dispatch-deploy zum Platform-Repo (Stage 3)
-#   - Push ins Development-Tier vfeeg-development/vfeeg-backend (Migration,
-#     braucht VFEEG_DEV_PUSH_PAT + Naming-Mapping wie bei eda-xp/kep)
+# gemeinstrom-Fork-Variante des upstream rolling-release-Workflows.
+# Delta zum Upstream:
+#   - Push nach ghcr.io/gemeinstrom/* statt ghcr.io/vfeeg-development/*
+#   - GITHUB_TOKEN statt VFEEG_DEV_PUSH_PAT (same-org push)
+#   - dispatch-deploy Jobs entfernt (Cutover läuft kontrolliert manuell)
+# Aufgesetzt im Rahmen des Cutover-Plans 2026-07-12.
 
 name: Docker Image CI
 
@@ -20,17 +15,10 @@ on:
       - 'preview/**'
     tags:
       - v*
-  pull_request:
-    branches:
-      - master
-      - main
 
 env:
   REGISTRY: "ghcr.io"
-  # Development-Tier (ADR-0005): Push nach vfeeg-development. Image-Name
-  # `vfeeg-backend` = prod-/dev-Image-Name (das Binary heisst auch so),
-  # NICHT der Repo-Name eegfaktura-master.
-  IMAGE_NAME: vfeeg-development/vfeeg-backend
+  IMAGE_NAME: gemeinstrom/${{ github.event.repository.name }}
 
 jobs:
   build-and-push-image:
@@ -61,7 +49,7 @@ jobs:
             type=semver,pattern={{major}}
             type=sha,format=short,prefix=sha-
           labels: |
-            org.opencontainers.image.title="eegfaktura-master"
+            org.opencontainers.image.title="eegfaktura-backend"
             org.opencontainers.image.description="VFEEG Master Backend (vfeeg-backend) — EDA/MQTT, GraphQL, billing master data"
             org.opencontainers.image.source=${{ github.event.repository.html_url || '' }}
             org.opencontainers.image.url=${{ github.event.repository.html_url || '' }}
@@ -71,90 +59,33 @@ jobs:
             org.opencontainers.image.authors="eegfaktura@vfeeg.org"
             org.opencontainers.image.vendor="Verein zur Förderung von Erneuerbaren Energiegemeinschaften"
             org.opencontainers.image.licenses=${{ github.event.repository.license.spdx_id || '' }}
-            org.opencontainers.image.revision.sha=${{ github.sha || '' }}
+            org.opencontainers.image.ref.name=${{ github.ref || '' }}
+            org.opencontainers.image.ref.branch=${{ github.ref_type == 'branch' && github.ref || '' }}
+            org.opencontainers.image.ref.tag=${{ github.ref_type == 'tag' && github.ref || '' }}
+            org.opencontainers.image.ref.sha=${{ github.sha || '' }}
             org.opencontainers.image.repository=${{ github.repository || '' }}
             org.opencontainers.image.repository.url=${{ github.event.repository.html_url || '' }}
 
       - name: Login to Container Registry
-        # Nur bei push-Events anmelden — PRs (auch aus Forks) duerfen nicht pushen.
-        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          # Cross-Org-Push nach vfeeg-development — GITHUB_TOKEN reicht nicht.
-          password: ${{ secrets.VFEEG_DEV_PUSH_PAT }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build (PR) / Build and push (push)
+      - name: Build and push Docker image
         id: push
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name == 'push' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags || 'latest' }}
           labels: ${{ steps.meta.outputs.labels || '' }}
           annotations: ${{ steps.meta.outputs.annotations }}
 
       - name: Generate artifact attestation
-        if: github.event_name == 'push'
         uses: actions/attest-build-provenance@v1
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
-
-  # Triggert das Platform-Repo, damit es den Cluster aktualisiert (Stage 3).
-  # Laeuft nur bei push to default-branch (master/main), nicht bei PRs/Tags.
-  # Vorbedingung: PLATFORM_DEPLOY_PAT-Secret im Repo + Mapping `deploy-backend`
-  # in deploy-on-dispatch.yml + Manifest k8s/30-backend.yaml zeigt auf
-  # vfeeg-development/vfeeg-backend:latest.
-  dispatch-deploy:
-    needs: build-and-push-image
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger deploy in platform repo
-        env:
-          GH_TOKEN: ${{ secrets.PLATFORM_DEPLOY_PAT }}
-        run: |
-          PAYLOAD=$(cat <<EOF
-          {
-            "event_type": "deploy-backend",
-            "client_payload": {
-              "image_tag": "latest",
-              "source_sha": "${GITHUB_SHA}",
-              "source_repo": "${GITHUB_REPOSITORY}",
-              "source_ref": "${GITHUB_REF}"
-            }
-          }
-          EOF
-          )
-          echo "$PAYLOAD" | gh api repos/vfeeg-development/eegfaktura-platform/dispatches --input -
-          echo "Dispatched deploy-backend for sha=${GITHUB_SHA:0:8}"
-
-  # Preview-Deploy (ADR-0007): Push auf preview/** -> pinned Deploy des sha-Builds
-  # in die Dev-Zone, ohne main/Release anzufassen. Nur auf preview/**-Branches.
-  dispatch-preview-deploy:
-    needs: build-and-push-image
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/preview/')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger pinned preview deploy in platform repo
-        env:
-          GH_TOKEN: ${{ secrets.PLATFORM_DEPLOY_PAT }}
-        run: |
-          PAYLOAD=$(cat <<EOF
-          {
-            "event_type": "deploy-backend",
-            "client_payload": {
-              "mode": "pinned",
-              "image_tag": "sha-${GITHUB_SHA:0:7}",
-              "source_sha": "${GITHUB_SHA}",
-              "source_repo": "${GITHUB_REPOSITORY}",
-              "source_ref": "${GITHUB_REF}"
-            }
-          }
-          EOF
-          )
-          echo "$PAYLOAD" | gh api repos/vfeeg-development/eegfaktura-platform/dispatches --input -
-          echo "Dispatched pinned preview deploy-backend for sha-${GITHUB_SHA:0:7}"
