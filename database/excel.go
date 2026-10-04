@@ -5,13 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"at.ourproject/vfeeg-backend/model"
-	"at.ourproject/vfeeg-backend/util"
+	"github.com/doug-martin/goqu/v9"
 	"github.com/jjeffery/civil"
 	log "github.com/sirupsen/logrus"
 	"github.com/xuri/excelize/v2"
@@ -68,20 +69,21 @@ func (db *sqlDatabase) ImportMasterdataFromExcel(ctx context.Context, r io.Reade
 	}
 
 	importLog := &model.Log{Operation: "Excel Master Data Import", Messages: []*model.LogMessage{}}
-	participants := transformExcelData(rows, gridOperatorName, eeg.Online, importLog)
+	participants := transformExcelData(rows, gridOperatorName, eeg.Online, eeg.CommunityId, importLog)
 	log.Debugf("Rows: %+v", rows)
 	log.Debugf("LEN _ Import participants: %v", len(participants))
 
+	db.reportDuplicateParticipantNumbers(ctx, strings.ToUpper(tenant), participants, importLog)
+
 	for _, p := range participants {
-		err = db.ImportParticipant(ctx, strings.ToUpper(tenant), "excel", p)
-		if err != nil {
+		// Jeder Teilnehmer läuft in seiner eigenen Transaktion — ein Fehler wird
+		// protokolliert, die restlichen Zeilen werden trotzdem importiert.
+		if err := db.ImportParticipant(ctx, strings.ToUpper(tenant), "excel", p); err != nil {
 			importLog.Messages = append(importLog.Messages, model.NewLogMessageFromVfeegError(
 				fmt.Sprintf("%s %s", p.FirstName, p.LastName),
 				err,
 			))
 			log.Errorf("Error Import Participant from Excel: %s", err.Error())
-			return db.SaveNotificationFromMap(CreateNotificationMessageFromLog(importLog), tenant,
-				model.N_TYPE_NOTIFICATION, model.N_PROCESS_IMPORT_EXCEL, "ADMIN")
 		}
 	}
 
@@ -94,6 +96,70 @@ func (db *sqlDatabase) ImportMasterdataFromExcel(ctx context.Context, r io.Reade
 	}
 
 	return err
+}
+
+// reportDuplicateParticipantNumbers warnt (ohne die Zeilen abzulehnen), wenn eine
+// MitgliedsNr in der Datei mehrfach vorkommt oder im Bestand bereits an ein ANDERES
+// Mitglied vergeben ist. Re-Import-Zeilen eines bestehenden Mitglieds (gleicher
+// Name) lösen keine Warnung aus.
+func (db *sqlDatabase) reportDuplicateParticipantNumbers(ctx context.Context, tenant string, participants []*model.EegParticipant, importLog *model.Log) {
+	byNumber := map[string][]*model.EegParticipant{}
+	for _, p := range participants {
+		if nr := p.ParticipantNumber.String; nr != "" {
+			byNumber[nr] = append(byNumber[nr], p)
+		}
+	}
+	if len(byNumber) == 0 {
+		return
+	}
+
+	for nr, ps := range byNumber {
+		if len(ps) > 1 {
+			names := make([]string, len(ps))
+			for i, p := range ps {
+				names[i] = fmt.Sprintf("%s %s", p.FirstName, p.LastName)
+			}
+			importLog.Messages = append(importLog.Messages, model.NewLogMessage(
+				"WARNING",
+				nr,
+				"W_PARTICIPANT_NR_DUP",
+				fmt.Sprintf("MitgliedsNr %s is used by several members in the file: %s", nr, strings.Join(names, ", ")),
+			))
+		}
+	}
+
+	type existingParticipant struct {
+		Number    string `db:"participantNumber"`
+		FirstName string `db:"firstname"`
+		LastName  string `db:"lastname"`
+	}
+	stmt, _, err := pgDialect.From("base.participant").
+		Select("participantNumber", "firstname", "lastname").
+		Where(
+			goqu.C("tenant").Eq(tenant),
+			goqu.C("participantNumber").IsNotNull(),
+			goqu.C("participantNumber").Neq("")).ToSQL()
+	if err != nil {
+		log.WithError(err).Warn("duplicate participant number check skipped")
+		return
+	}
+	var existing []existingParticipant
+	if err := db.db.SelectContext(ctx, &existing, stmt); err != nil {
+		log.WithError(err).Warn("duplicate participant number check skipped")
+		return
+	}
+	for _, e := range existing {
+		for _, p := range byNumber[e.Number] {
+			if p.FirstName != e.FirstName || p.LastName != e.LastName {
+				importLog.Messages = append(importLog.Messages, model.NewLogMessage(
+					"WARNING",
+					e.Number,
+					"W_PARTICIPANT_NR_DUP",
+					fmt.Sprintf("MitgliedsNr %s is already assigned to existing member %s %s", e.Number, e.FirstName, e.LastName),
+				))
+			}
+		}
+	}
 }
 
 func CreateNotificationMessageFromLog(logMsg *model.Log) map[string]interface{} {
@@ -410,6 +476,10 @@ func generateParticipantMastersheet(f *excelize.File, participants []*model.EegP
 	return err
 }
 
+// findParticipant sammelt die Zeilen eines Mitglieds ein (eine Zeile je Zählpunkt).
+// Der Abgleich läuft bewusst NUR über Vor-+Nachname: Bestandsdateien vergeben die
+// MitgliedsNr teils fortlaufend pro Zeile (nicht pro Mitglied), sie taugt daher
+// nicht als Schlüssel. Bekannte Limitation: namensgleiche Personen verschmelzen.
 func findParticipant(participants []*model.EegParticipant, firstname, lastname string) (*model.EegParticipant, bool) {
 	for _, p := range participants {
 		if p.FirstName == firstname && p.LastName == lastname {
@@ -492,10 +562,13 @@ func importEmail(raw, firstname, lastname string, importLog *model.Log) null.Str
 	return null.StringFrom(normalized)
 }
 
-func transformExcelData(rows *excelize.Rows, gridOperatorName func(id string) string, online bool, importLog *model.Log) []*model.EegParticipant {
+func transformExcelData(rows *excelize.Rows, gridOperatorName func(id string) string, online bool, communityId string, importLog *model.Log) []*model.EegParticipant {
 	colMap := map[string]int{}
 	participants := []*model.EegParticipant{}
 	defaultPartFact := "100"
+	// je falscher (bzw. fehlender) Gemeinschafts-ID nur EINE Meldung —
+	// sonst N Meldungen bei komplett falscher Datei
+	rejectedCommunityIds := map[string]bool{}
 
 	businessRole := func(cols []string, values map[string]int) string {
 		val := getColumValue(cols, colMap, "BusinessRole", "BusinessRole", nil)
@@ -522,12 +595,22 @@ func transformExcelData(rows *excelize.Rows, gridOperatorName func(id string) st
 	}
 
 	partFact := func(cols []string, values map[string]int) int {
-		val := getColumValue(cols, colMap, "Teilnehmerfaktor", "PartFact", &defaultPartFact)
-		s, err := strconv.Atoi(val)
-		if err != nil {
+		// Vorlagen-Spalte heißt "Zugeteilte Menge in Prozent"; ältere Dateien
+		// verwenden "Teilnehmerfaktor"/"PartFact".
+		val := getColumValue(cols, colMap, "Zugeteilte Menge in Prozent", "Allocated Quantity in Percent", nil)
+		if len(val) == 0 {
+			val = getColumValue(cols, colMap, "Teilnehmerfaktor", "PartFact", &defaultPartFact)
+		}
+		val = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(val), "%"))
+		f, err := strconv.ParseFloat(strings.ReplaceAll(val, ",", "."), 64)
+		if err != nil || f <= 0 {
 			return 100
 		}
-		return s
+		// Prozent-formatierte Zellen liefern im Raw-Modus den Bruchwert (50 % -> "0.5").
+		if f < 1 {
+			f = f * 100
+		}
+		return int(math.Round(f))
 	}
 
 	getCivilDatePtr := func(date civil.Date) *civil.Date {
@@ -535,21 +618,22 @@ func transformExcelData(rows *excelize.Rows, gridOperatorName func(id string) st
 	}
 
 	getColumDate := func(cols []string, values map[string]int, deName, enName string, defaultValue *civil.Date) civil.NullDate {
+		// Zellen werden mit RawCellValue gelesen: eine als Datum formatierte Zelle
+		// liefert die Excel-Serialzahl, nicht "t.m.jjjj" — parseExcelDate kann beides.
 		v := getColumValue(cols, colMap, deName, enName, nil)
-		d, err := util.ParseTimeString(v)
-		if err != nil {
-			if defaultValue != nil {
-				return civil.NullDate{
-					Date:  *defaultValue,
-					Valid: true,
-				}
+		if isDateString(v) || isDate(v) {
+			return civil.NullDate{
+				Date:  civil.DateOf(parseExcelDate(v)),
+				Valid: true,
 			}
-			return civil.NullDate{}
 		}
-		return civil.NullDate{
-			Date:  d,
-			Valid: true,
+		if defaultValue != nil {
+			return civil.NullDate{
+				Date:  *defaultValue,
+				Valid: true,
+			}
 		}
+		return civil.NullDate{}
 	}
 
 	getParticipantStatus := func(state string) model.ProcessStatusType {
@@ -585,8 +669,31 @@ func transformExcelData(rows *excelize.Rows, gridOperatorName func(id string) st
 				continue
 			default:
 				switch {
-				case netOperatorMatch.MatchString(cols[0]):
-					netOperatorId := cols[0]
+				case netOperatorMatch.MatchString(strings.TrimSpace(cols[0])):
+					netOperatorId := strings.TrimSpace(cols[0])
+
+					// "Gemeinschafts-ID" ist Pflicht und muss zur Ziel-EEG passen — schützt
+					// davor, die Datei einer anderen EEG (oder im falschen Tenant
+					// eingeloggt) kommentarlos zu importieren.
+					rowCommunityId := strings.TrimSpace(getColumValue(cols, colMap, "Gemeinschafts-ID", "Community Id", nil))
+					if communityId != "" && !strings.EqualFold(rowCommunityId, communityId) {
+						if !rejectedCommunityIds[rowCommunityId] {
+							rejectedCommunityIds[rowCommunityId] = true
+							msg := fmt.Sprintf("Rows skipped: 'Gemeinschafts-ID' %s does not match this community (%s) — wrong file or wrong community selected?", rowCommunityId, communityId)
+							if rowCommunityId == "" {
+								msg = fmt.Sprintf("Rows skipped: 'Gemeinschafts-ID' is empty — the column is required and must match this community (%s)", communityId)
+							}
+							importLog.Messages = append(importLog.Messages, model.NewLogMessage(
+								"ERROR",
+								rowCommunityId,
+								"E_COMMUNITY_1000",
+								msg,
+							))
+							log.Warnf("Import rows skipped: community id %q does not match target %q", rowCommunityId, communityId)
+						}
+						continue
+					}
+
 					var firstname string
 					var lastname string
 
@@ -595,7 +702,13 @@ func transformExcelData(rows *excelize.Rows, gridOperatorName func(id string) st
 
 					if len(excelName2) == 0 || len(excelName2) < 2 {
 						if _, err := fmt.Sscanf(getColumValue(cols, colMap, "Name 2", "Name2", nil), "%s %s", &lastname, &firstname); err != nil {
-							fmt.Printf("Error Name extracting: %s (%s)\n", err, getColumValue(cols, colMap, "Name 1", "Name1", nil))
+							importLog.Messages = append(importLog.Messages, model.NewLogMessage(
+								"ERROR",
+								strings.Trim(getColumValue(cols, colMap, "Zählpunkt", "MeteringPoint Id", nil), " "),
+								"E_PARTICIPANT_1001",
+								fmt.Sprintf("Row skipped: 'Name 1' is missing and 'Name 2' (%s) cannot be split into last and first name", excelName1),
+							))
+							log.Warnf("Import row skipped: cannot extract name from %q", excelName1)
 							continue
 						}
 					} else {
@@ -603,21 +716,36 @@ func transformExcelData(rows *excelize.Rows, gridOperatorName func(id string) st
 						lastname = excelName1
 					}
 
-					role := model.UNKNOWN
-					switch strings.ToUpper(strings.Trim(getColumValue(cols, colMap, "Energierichtung", "Energy Direction", nil), " ")) {
+					directionVal := strings.ToUpper(strings.TrimSpace(getColumValue(cols, colMap, "Energierichtung", "Energy Direction", nil)))
+					role := model.CONSUMPTION
+					switch directionVal {
 					case "GENERATION":
 						role = model.GENERATOR
-					case "CONSUMPTION":
+					case "CONSUMPTION", "":
+						// leer = dokumentierter Default (Verbraucher)
 						role = model.CONSUMPTION
 					default:
-						role = model.CONSUMPTION
+						// Tippfehler würde einen Erzeuger-ZP still als Verbraucher importieren
+						// -> Zeile ablehnen und melden statt raten.
+						importLog.Messages = append(importLog.Messages, model.NewLogMessage(
+							"ERROR",
+							strings.Trim(getColumValue(cols, colMap, "Zählpunkt", "MeteringPoint Id", nil), " "),
+							"E_COUNTERPOINT_1001",
+							fmt.Sprintf("Row skipped: unknown 'Energierichtung' %q (expected CONSUMPTION or GENERATION)", directionVal),
+						))
+						log.Warnf("Import row skipped: unknown energy direction %q", directionVal)
+						continue
 					}
 
 					streetNumber := getColumValue(cols, colMap, "Hausnummer", "Street Number", nil)
 					var participantSince civil.NullDate
-					docSignedAt := getColumValue(cols, colMap, "Dokument unterschrieben", "Document Signature Date", nil)
-					if len(docSignedAt) > 0 {
-						excelDate := civil.DateOf(parseExcelDate(docSignedAt))
+					memberSince := getColumValue(cols, colMap, "Mitglied seit", "member since", nil)
+					if len(memberSince) == 0 {
+						// ältere Vorlagen-Varianten
+						memberSince = getColumValue(cols, colMap, "Dokument unterschrieben", "Document Signature Date", nil)
+					}
+					if isDateString(memberSince) || isDate(memberSince) {
+						excelDate := civil.DateOf(parseExcelDate(memberSince))
 						participantSince = civil.NullDateFrom(&excelDate)
 					} else {
 						today := civil.Today()
@@ -628,23 +756,27 @@ func transformExcelData(rows *excelize.Rows, gridOperatorName func(id string) st
 					if online {
 						registeredSince = civil.Today()
 					} else {
-						regDateAt := getColumValue(cols, colMap, "Mitglied seit", "member since", nil)
-						if len(regDateAt) > 0 {
+						// Vorlagen-Spalte "registriert seit" = Zählpunkt registriert seit
+						// ("Mitglied seit" gehört zum Mitglied, s. participantSince oben).
+						regDateAt := getColumValue(cols, colMap, "registriert seit", "registriert since", nil)
+						if isDateString(regDateAt) || isDate(regDateAt) {
 							registeredSince = civil.DateOf(parseExcelDate(regDateAt))
 						} else {
 							registeredSince = civil.DateFor(time.Now().Year(), 1, 1)
 						}
 					}
 
-					cpStatus := getColumValue(cols, colMap, "Zählpunktstatus", "Metering Point State", nil)
+					// tolerant gegenüber Gross-/Kleinschreibung und umgebenden Leerzeichen
+					cpStatus := strings.ToUpper(strings.TrimSpace(getColumValue(cols, colMap, "Zählpunktstatus", "Metering Point State", nil)))
 					if cpStatus == "ACTIVE" || cpStatus == "ACTIVATED" || cpStatus == "REGISTERED" || cpStatus == "NEW" {
+						participantNumber := getColumValue(cols, colMap, "MitgliedsNr", "ParticipantNr", nil)
 						var participant *model.EegParticipant
 						if p, ok := findParticipant(participants, firstname, lastname); ok {
 							participant = p
 						} else {
 							participant = &model.EegParticipant{
 								EegParticipantBase: model.EegParticipantBase{
-									ParticipantNumber: null.StringFrom(getColumValue(cols, colMap, "MitgliedsNr", "ParticipantNr", nil)),
+									ParticipantNumber: null.StringFrom(participantNumber),
 									FirstName:         firstname,
 									LastName:          lastname,
 									TitleBefore:       null.StringFrom(getColumValue(cols, colMap, "TitelVor", "TitleBefor", nil)),
@@ -729,6 +861,19 @@ func transformExcelData(rows *excelize.Rows, gridOperatorName func(id string) st
 								"E_PARTICIPANT_1000",
 								fmt.Sprintf("Does not fulfill requirements! Participant has wrong status: %s", cpStatus)))
 						log.Warnf("Participant -%s %s- does not fulfill requirements! Participant has wrong status: %s", firstname, lastname, cpStatus)
+					}
+				default:
+					// Zeile sieht wie eine Datenzeile aus (Zählpunkt oder Name vorhanden),
+					// hat aber keinen gültigen Netzbetreiber -> melden statt still verwerfen.
+					if len(getColumValue(cols, colMap, "Zählpunkt", "MeteringPoint Id", nil)) > 0 ||
+						len(getColumValue(cols, colMap, "Name 1", "Name1", nil)) > 0 {
+						importLog.Messages = append(importLog.Messages, model.NewLogMessage(
+							"ERROR",
+							cols[0],
+							"E_PARTICIPANT_1002",
+							"Row skipped: 'Netzbetreiber' (column A) is missing or invalid (expected e.g. AT003000)",
+						))
+						log.Warnf("Import row skipped: invalid grid operator %q", cols[0])
 					}
 				}
 			}

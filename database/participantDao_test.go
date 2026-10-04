@@ -71,8 +71,87 @@ func TestRegisterParticipant(t *testing.T) {
 	db, err := GetDB(context.Background())
 	require.NoError(t, err)
 
-	err = db.RegisterParticipant("RC200200", "petero", &p)
+	err = db.RegisterParticipant(context.Background(), "RC200200", "petero", &p)
 	assert.NoError(t, err)
+}
+
+// A caller that omits or mislabels an address block must not be able to create
+// an address row the read paths cannot find: they join on type = 'RESIDENCE' /
+// 'BILLING', so a row with an empty type is invisible and unrepairable.
+func TestEnforceAddressTypes(t *testing.T) {
+	var tests = []struct {
+		name string
+		json string
+		// what the caller supplied — against main these values reach the INSERT
+		residentBefore model.AddressType
+		billingBefore  model.AddressType
+	}{
+		{
+			name:          "residentAddress fehlt komplett",
+			json:          `{"firstname":"Anna","lastname":"Berger","billingAddress":{"street":"Hauptstrasse","streetNumber":"1","zip":"1010","city":"Wien","type":"BILLING"}}`,
+			billingBefore: model.BILLING,
+		},
+		{
+			name: "beide Blöcke ohne type",
+			json: `{"firstname":"Anna","lastname":"Berger","billingAddress":{"street":"Hauptstrasse"},"residentAddress":{"street":"Hauptstrasse"}}`,
+		},
+		{
+			name:           "Client vertauscht die Typen",
+			json:           `{"firstname":"Anna","lastname":"Berger","billingAddress":{"type":"RESIDENCE"},"residentAddress":{"type":"BILLING"}}`,
+			residentBefore: model.BILLING,
+			billingBefore:  model.RESIDENCE,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var p model.EegParticipant
+			require.NoError(t, json.NewDecoder(strings.NewReader(tt.json)).Decode(&p))
+
+			require.Equal(t, tt.residentBefore, p.ResidentAddress.Type)
+			require.Equal(t, tt.billingBefore, p.BillingAddress.Type)
+
+			enforceAddressTypes(&p)
+
+			assert.Equal(t, model.RESIDENCE, p.ResidentAddress.Type)
+			assert.Equal(t, model.BILLING, p.BillingAddress.Type)
+
+			// the row that actually reaches base.address must carry the type
+			extra := map[string]interface{}{"participant_id": "p1"}
+			assert.Equal(t, model.RESIDENCE, toRecord(p.ResidentAddress, extra)["type"])
+			assert.Equal(t, model.BILLING, toRecord(p.BillingAddress, extra)["type"])
+		})
+	}
+}
+
+// The stamping has to be wired into the register path, not just available as a
+// helper: this is the payload shape that produced the untyped rows in
+// production — a member created through the API with no residentAddress block.
+// With an empty meter list saveMeteringPoint returns before issuing SQL, so the
+// statement order is exactly participant, contactdetail, bankaccount, address.
+func TestRegisterParticipantStampsResidenceType(t *testing.T) {
+	mockDb, err := GetMockDb()
+	require.NoError(t, err)
+
+	participantJson := `{"businessRole":"EEG_PRIVATE","firstname":"Anna","lastname":"Berger","contact":{"email":"anna.berger@example.at"},"accountInfo":{},"optionals":{},"status":"NEW","role":"EEG_USER","billingAddress":{"street":"Hauptstrasse","streetNumber":"1","zip":"1010","city":"Wien","type":"BILLING"},"meters":[]}`
+
+	var p model.EegParticipant
+	require.NoError(t, json.NewDecoder(strings.NewReader(participantJson)).Decode(&p))
+	require.Empty(t, p.ResidentAddress.Type, "fixture must not carry a resident type")
+
+	mockDb.Mock.ExpectBegin()
+	mockDb.Mock.ExpectQuery("INSERT (.+)").WillReturnRows(sqlmock.NewRows([]string{"id"}).FromCSVString("1"))
+	mockDb.Mock.ExpectExec(`INSERT INTO "base"\."contactdetail"`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mockDb.Mock.ExpectExec(`INSERT INTO "base"\."bankaccount"`).WillReturnResult(sqlmock.NewResult(1, 1))
+	// both tuples in order: without the fix the second one carries an empty type
+	mockDb.Mock.ExpectExec(`INSERT INTO "base"\."address" .*'BILLING'.*'RESIDENCE'`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mockDb.Mock.ExpectCommit()
+
+	db, err := GetDB(context.Background())
+	require.NoError(t, err)
+
+	require.NoError(t, db.RegisterParticipant(context.Background(), "RC200200", "annab", &p))
+	assert.NoError(t, mockDb.Mock.ExpectationsWereMet())
 }
 
 func TestGetParticipant(t *testing.T) {
@@ -113,7 +192,7 @@ func TestGetParticipant(t *testing.T) {
 
 	mockDb.Mock.ExpectQuery("SELECT (.+) FROM \"base\".\"meteringpoint\", (.+)").WillReturnRows(meterRows)
 
-	participants, err := db.GetParticipants("RC100298")
+	participants, err := db.GetParticipants(context.Background(), "RC100298")
 	assert.NoError(t, err)
 
 	assert.NotEmpty(t, participants)
@@ -127,7 +206,7 @@ func Test_GetParticipants(t *testing.T) {
 	db, err := GetTestDB(context.Background(), testDB)
 	require.NoError(t, err)
 
-	participants, err := db.GetParticipants("TE000002")
+	participants, err := db.GetParticipants(context.Background(), "TE000002")
 	require.NoError(t, err)
 
 	require.Equal(t, 1, len(participants))
@@ -189,7 +268,7 @@ func Test_saveParticipant(t *testing.T) {
 		tenant                     string
 		username                   string
 		participant                *model.EegParticipant
-		registerMeteringPointsFunc func(*sqlx.Tx, string, string, string, []*model.MeteringPoint) error
+		registerMeteringPointsFunc func(context.Context, *sqlx.Tx, string, string, string, []*model.MeteringPoint) error
 	}
 
 	mDB, mock, err := sqlmock.New()
@@ -225,7 +304,7 @@ func Test_saveParticipant(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tx, err := tt.args.db.Beginx()
 			assert.NoError(t, err)
-			err = saveParticipant(tx, tt.args.tenant, tt.args.username, tt.args.participant, tt.args.registerMeteringPointsFunc)
+			err = saveParticipant(context.Background(), tx, tt.args.tenant, tt.args.username, tt.args.participant, tt.args.registerMeteringPointsFunc)
 			assert.NoError(t, tx.Commit())
 			assert.NoError(t, mock.ExpectationsWereMet())
 			require.NoError(t, err)
@@ -469,10 +548,10 @@ func TestImportParticipant(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 
-			err = db.ImportParticipant("TE000001", "test", tt.params)
+			err = db.ImportParticipant(context.Background(), "TE000001", "test", tt.params)
 			assert.NoError(t, err)
 
-			p, err := db.FindParticipantByMeteringPoint("TE000001", tt.mp)
+			p, err := db.FindParticipantByMeteringPoint(context.Background(), "TE000001", tt.mp)
 			assert.NoError(t, err)
 
 			tt.test(t, p)
@@ -533,15 +612,57 @@ func TestUpdateParticipant1(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := db.UpdateParticipant(tt.args.tenant, tt.args.user, tt.args.participant)
+			err := db.UpdateParticipant(context.Background(), tt.args.tenant, tt.args.user, tt.args.participant)
 			assert.NoError(t, err)
 
-			pUnderTest, err := db.QueryParticipant(tt.args.participant.Id.String())
+			pUnderTest, err := db.QueryParticipant(context.Background(), tt.args.tenant, tt.args.participant.Id.String())
 			assert.NoError(t, err)
 
 			tt.wantErr(t, pUnderTest, tt.args.participant)
 		})
 	}
+}
+
+// Der Fixture-Teilnehmer ea9942da-... gehoert zu TE000001. Ein Zugriff aus einer
+// anderen Gemeinschaft muss abgewiesen werden - frueher lief er durch, weil die
+// Abfragen nur nach der ID gefiltert haben.
+func TestParticipantTenantScope(t *testing.T) {
+	const (
+		ownTenant     = "TE000001"
+		foreignTenant = "TE000004"
+		participantId = "ea9942da-03da-11ee-b82b-5a985b4b033a"
+	)
+
+	db, err := GetDB(context.Background())
+	assert.NoError(t, err)
+
+	t.Run("eigener Mandant liest", func(t *testing.T) {
+		p, err := db.GetParticipant(context.Background(), ownTenant, participantId)
+		assert.NoError(t, err)
+		assert.NotNil(t, p)
+	})
+
+	t.Run("fremder Mandant wird abgewiesen", func(t *testing.T) {
+		_, err := db.GetParticipant(context.Background(), foreignTenant, participantId)
+		assert.Error(t, err)
+
+		_, err = db.QueryParticipant(context.Background(), foreignTenant, participantId)
+		assert.Error(t, err)
+
+		err = db.UpdateParticipantPartial(context.Background(), foreignTenant, participantId, "contact.phone", "0000")
+		assert.Error(t, err)
+
+		err = db.ConfirmParticipant(context.Background(), foreignTenant, "test", participantId)
+		assert.Error(t, err)
+
+		err = db.DeleteParticipant(context.Background(), foreignTenant, participantId)
+		assert.Error(t, err)
+	})
+
+	t.Run("leerer Mandant wird abgewiesen", func(t *testing.T) {
+		_, err := db.GetParticipant(context.Background(), "", participantId)
+		assert.Error(t, err)
+	})
 }
 
 func TestUpdateParticipantPartial(t *testing.T) {
@@ -616,10 +737,10 @@ func TestUpdateParticipantPartial(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 
-			err = db.UpdateParticipantPartial(tt.participantId, tt.param, tt.value)
+			err = db.UpdateParticipantPartial(context.Background(), "TE000001", tt.participantId, tt.param, tt.value)
 			assert.NoError(t, err)
 
-			p, err := db.GetParticipant(tt.participantId)
+			p, err := db.GetParticipant(context.Background(), "TE000001", tt.participantId)
 			assert.NoError(t, err)
 
 			tt.test(t, p)

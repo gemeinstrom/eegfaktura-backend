@@ -2,6 +2,7 @@ package database
 
 import (
 	"at.ourproject/vfeeg-backend/model"
+	"github.com/jjeffery/civil"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -20,12 +21,12 @@ func TestNewDatabase(t *testing.T) {
 	db, err := GetDB(ctx)
 	require.NoError(t, err)
 
-	eeg, err := db.GetEegByEcId("AT00300000000TC000001000000000001")
+	eeg, err := db.GetEegByEcId(context.Background(), "AT00300000000TC000001000000000001")
 	require.NoError(t, err)
 
 	assert.Equal(t, "MY-TEST", eeg.Name)
 
-	participants, err := db.GetParticipants("TE000001")
+	participants, err := db.GetParticipants(context.Background(), "TE000001")
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, len(participants))
@@ -36,7 +37,7 @@ func TestGetEeg(t *testing.T) {
 	db, err := GetDB(context.Background())
 	require.NoError(t, err)
 
-	eeg, err := db.GetEegById("TE000001")
+	eeg, err := db.GetEegById(context.Background(), "TE000001")
 	assert.NoError(t, err)
 
 	expectedEeg := &model.Eeg{
@@ -75,6 +76,8 @@ func TestGetEeg(t *testing.T) {
 		Optionals: model.Optionals{Website: null.StringFrom("test-eeg.at")},
 		//Periods:   nil,
 		Online: false,
+		// createdAt hat einen DB-Default (now()) — Fixture wird beim Testlauf angelegt.
+		CreatedAt: civil.NullDate{Date: civil.Today(), Valid: true},
 	}
 	assert.Equal(t, expectedEeg, eeg)
 }
@@ -144,7 +147,7 @@ func TestUpdateEeg(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mock.ExpectExec("INSERT INTO (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-			tt.wantErr(t, mDB.InsertEeg(tt.args.tenant, tt.args.eeg), fmt.Sprintf("InsertEeg(%v, %+v)", tt.args.tenant, tt.args.eeg))
+			tt.wantErr(t, mDB.InsertEeg(context.Background(), tt.args.tenant, tt.args.eeg), fmt.Sprintf("InsertEeg(%v, %+v)", tt.args.tenant, tt.args.eeg))
 			assert.NoError(t, mock.ExpectationsWereMet())
 			require.NoError(t, err)
 		})
@@ -155,7 +158,7 @@ func TestGetEegById(t *testing.T) {
 	db, err := GetDB(context.Background())
 	require.NoError(t, err)
 
-	eeg, err := db.GetEegById("TE000001")
+	eeg, err := db.GetEegById(context.Background(), "TE000001")
 	assert.NoError(t, err)
 
 	println(eeg)
@@ -286,10 +289,10 @@ func TestUpdateEegPartial1(t *testing.T) {
 			db, err := GetDB(context.Background())
 			assert.NoError(t, err)
 
-			err = db.UpdateEegPartial(tt.eeg, tt.param)
+			err = db.UpdateEegPartial(context.Background(), tt.eeg, tt.param)
 			assert.NoError(t, err)
 
-			eeg, err := db.GetEegById(tt.eeg)
+			eeg, err := db.GetEegById(context.Background(), tt.eeg)
 			assert.NoError(t, err)
 
 			tt.test(t, eeg)

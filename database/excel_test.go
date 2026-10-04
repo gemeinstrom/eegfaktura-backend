@@ -33,7 +33,7 @@ func Test_transformExcelData(t *testing.T) {
 	require.NoError(t, err)
 
 	importLog := &model.Log{Operation: "Excel Master Data Import", Messages: []*model.LogMessage{}}
-	participants := transformExcelData(rows, func(id string) string { return id }, false, importLog)
+	participants := transformExcelData(rows, func(id string) string { return id }, false, "AT00999900000TC100200000000000002", importLog)
 
 	findParticipant := func(n string, p []*model.EegParticipant) *model.EegParticipant {
 		for i := range p {
@@ -99,8 +99,8 @@ func TestImportMasterdataFromExcel(t *testing.T) {
 
 			},
 			test: func(t *testing.T, args args) {
-				require.NoError(t, db.ImportMasterdataFromExcel(args.r, args.filename, args.sheet, args.tenant))
-				ps, err := db.GetParticipants(args.tenant)
+				require.NoError(t, db.ImportMasterdataFromExcel(context.Background(), args.r, args.filename, args.sheet, args.tenant))
+				ps, err := db.GetParticipants(context.Background(), args.tenant)
 				require.NoError(t, err)
 				assert.Equal(t, 7, len(ps))
 
@@ -190,10 +190,10 @@ func TestExportMasterdataToExcel(t *testing.T) {
 	require.NoError(t, err)
 
 	tenant := "TE000002"
-	eeg, err := db.GetEegById(tenant)
+	eeg, err := db.GetEegById(context.Background(), tenant)
 	require.NoError(t, err)
 
-	participants, err := db.GetParticipants(tenant)
+	participants, err := db.GetParticipants(context.Background(), tenant)
 	require.NoError(t, err)
 
 	tariffMap, err := db.GetTariffNameMap(tenant)

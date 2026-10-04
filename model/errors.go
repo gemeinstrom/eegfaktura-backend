@@ -46,6 +46,10 @@ var ErrArchiveParticipant = PartialWrap(1105)
 var ErrFindParticipant = PartialWrap(1106)
 var ErrDeleteParticipant = PartialWrap(1107)
 
+// Der Teilnehmer existiert, gehoert aber nicht zur Gemeinschaft des Aufrufers.
+// Bewusst eigener Code, damit sich Fremdzugriff im Log von "nicht gefunden" trennen laesst.
+var ErrForeignTenantParticipant = PartialWrap(1108)
+
 var ErrRemoveMeteringPoint = PartialWrap(1201)
 var ErrStatusMeter = PartialWrap(1202)
 var ErrSaveMeteringPoint = PartialWrap(1203)

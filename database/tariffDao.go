@@ -147,18 +147,24 @@ func archiveTariff(db *sqlx.DB, tenant string, id string) error {
 	if err != nil {
 		return model.ErrGetTariff(err)
 	}
-	_, err = db.Query(stmt)
+	rows, err := db.Query(stmt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return model.ErrTariffUtilized(ErrTariffUtilized)
+	}
+	if rows != nil {
+		_ = rows.Close()
 	}
 
 	stmt, _, err = pgDialect.Select("metering_point_id").From("base.meteringpoint").Where(goqu.Ex{"tariff_id": id, "tenant": tenant}).ToSQL()
 	if err != nil {
 		return err
 	}
-	_, err = db.Query(stmt)
+	rows, err = db.Query(stmt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return model.ErrTariffUtilized(ErrTariffUtilized)
+	}
+	if rows != nil {
+		_ = rows.Close()
 	}
 
 	// todo: use goqu for sql statement creation

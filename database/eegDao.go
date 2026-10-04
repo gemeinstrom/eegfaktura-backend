@@ -177,6 +177,7 @@ func getGridOperators(ctx context.Context, db *sqlx.DB) (map[string]string, erro
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	var id string
 	var name string
@@ -187,6 +188,9 @@ func getGridOperators(ctx context.Context, db *sqlx.DB) (map[string]string, erro
 			return nil, err
 		}
 		result[id] = name
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return result, nil

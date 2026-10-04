@@ -8,6 +8,7 @@ database:
   maxOpenConns: 20
   maxIdleConns: 25
   connMaxLifetime: "5m"
+  statsLogInterval: "1m"
 
 mqtt:
   host: "tcp://localhost:1883"
@@ -33,4 +34,4 @@ eda-process-versions:
   ANFORDERUNG_ECC: "01.20"
   ANFORDERUNG_CCMO: "01.20"
   ANFORDERUNG_GN: "03.12"
-  AUFHEBUNG_CCMS: "01.10"
+  AUFHEBUNG_CCMS: "01.30"

@@ -22,6 +22,8 @@ var db struct {
 
 type sqlDatabase struct {
 	db *sqlx.DB
+	// statsDone stops the pool-stats logger; closed by CloseDB.
+	statsDone chan struct{}
 }
 
 type Database interface {
@@ -73,9 +75,53 @@ func initDB(ctx context.Context) error {
 	sqlDB.db.SetMaxIdleConns(maxIdleConnections)
 	sqlDB.db.SetConnMaxLifetime(maxLifetimeConnections)
 
+	statsInterval := viper.GetDuration("database.statsLogInterval")
+	if statsInterval == 0 {
+		statsInterval = time.Minute
+	}
+	if statsInterval > 0 {
+		sqlDB.statsDone = make(chan struct{})
+		go sqlDB.logPoolStats(statsInterval)
+	}
+
 	db.Database = &sqlDB
 
 	return nil
+}
+
+// logPoolStats periodically writes the connection pool counters to the log until
+// CloseDB stops it. A leaking pool and a merely saturated one look alike from the
+// outside, but not here: InUse rising monotonically towards MaxOpenConnections and
+// never falling back means connections are not returned, whereas a growing
+// WaitCount with fluctuating InUse is plain saturation.
+func (db *sqlDatabase) logPoolStats(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-db.statsDone:
+			return
+		case <-ticker.C:
+			s := db.db.Stats()
+			entry := log.WithFields(log.Fields{
+				"open":              s.OpenConnections,
+				"inUse":             s.InUse,
+				"idle":              s.Idle,
+				"maxOpen":           s.MaxOpenConnections,
+				"waitCount":         s.WaitCount,
+				"waitDuration":      s.WaitDuration.String(),
+				"maxIdleClosed":     s.MaxIdleClosed,
+				"maxLifetimeClosed": s.MaxLifetimeClosed,
+			})
+			// Warn once the pool is nearly exhausted, so the onset is greppable.
+			if s.MaxOpenConnections > 0 && s.InUse*5 >= s.MaxOpenConnections*4 {
+				entry.Warn("db pool nearly exhausted")
+				continue
+			}
+			entry.Info("db pool stats")
+		}
+	}
 }
 
 // GetDB returns the current DB.
@@ -96,6 +142,10 @@ func GetDB(ctx context.Context) (Database, error) {
 
 func (db *sqlDatabase) CloseDB() error {
 	log.Info("Closing database connection")
+	if db.statsDone != nil {
+		close(db.statsDone)
+		db.statsDone = nil
+	}
 	if db.db != nil {
 		return db.db.Close()
 	}
