@@ -101,14 +101,14 @@ func (h *ParticipantHandler) updateParticipantPartial() middleware.JWTHandlerFun
 		name := p["path"].(string)
 		value := p["value"]
 
-		err = h.db.UpdateParticipantPartial(r.Context(), participantId, name, value)
+		err = h.db.UpdateParticipantPartial(r.Context(), tenant, participantId, name, value)
 		if err != nil {
 			log.WithField("tenant", tenant).WithError(err).Error("failed to update partial participant.")
 			respondWith(w, http.StatusInternalServerError, tenant, err)
 			return
 		}
 
-		participant, err := h.db.QueryParticipant(r.Context(), participantId)
+		participant, err := h.db.QueryParticipant(r.Context(), tenant, participantId)
 		if err != nil {
 			log.WithField("tenant", tenant).WithError(err).Error("failed to update partial participant.")
 			respondWith(w, http.StatusBadRequest, tenant, err)
@@ -159,14 +159,14 @@ func (h *ParticipantHandler) confirmParticipant() middleware.JWTHandlerFunc {
 			respondWith(w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
 			return
 		}
-		participant, err := h.db.QueryParticipant(r.Context(), participantId)
+		participant, err := h.db.QueryParticipant(r.Context(), tenant, participantId)
 		if err != nil {
 			log.WithField("tenant", tenant).WithError(err).Error("failed to confirm participant.")
 			respondWith(w, http.StatusBadRequest, tenant, err)
 			return
 		}
 
-		if err = h.db.ConfirmParticipant(r.Context(), claims.Username, participantId); err != nil {
+		if err = h.db.ConfirmParticipant(r.Context(), tenant, claims.Username, participantId); err != nil {
 			log.WithField("tenant", tenant).WithError(err).Error("failed to confirm participant.")
 			respondWith(w, http.StatusBadRequest, tenant, err)
 			return
@@ -228,7 +228,7 @@ func (h *ParticipantHandler) deleteParticipant() middleware.JWTHandlerFunc {
 		vars := mux.Vars(r)
 		idStr := vars["id"]
 
-		if err := h.db.DeleteParticipant(r.Context(), idStr); err != nil {
+		if err := h.db.DeleteParticipant(r.Context(), tenant, idStr); err != nil {
 			log.WithField("tenant", tenant).WithError(err).Error("failed to delete participant.")
 			respondWith(w, http.StatusBadRequest, tenant, err)
 			return

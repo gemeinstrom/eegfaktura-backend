@@ -271,10 +271,10 @@ func Test_ImportMeteringPoints(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 
-			err = db.ImportMeteringPoints(tt.args.tenant, "test", tt.args.participantId, tt.args.points)
+			err = db.ImportMeteringPoints(context.Background(), tt.args.tenant, "test", tt.args.participantId, tt.args.points)
 			require.NoError(t, err)
 
-			pUnderTest, err := db.QueryParticipant(tt.args.participantId)
+			pUnderTest, err := db.QueryParticipant(context.Background(), tt.args.tenant, tt.args.participantId)
 			require.NoError(t, err)
 
 			tt.validate(t, pUnderTest)
@@ -329,7 +329,7 @@ func Test_RegisterMeteringPoint(t *testing.T) {
 			//mock.Mock.ExpectExec("INSERT INTO \"base\".\"participant_meter_state\" (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
 			mock.ExpectExec("INSERT INTO \"base\".\"metering_partition_factor\" (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
 
-			assert.NoError(t, mDB.RegisterMeteringPoint(tt.args.tenant, "userId", tt.args.participantId, tt.args.point))
+			assert.NoError(t, mDB.RegisterMeteringPoint(context.Background(), tt.args.tenant, "userId", tt.args.participantId, tt.args.point))
 		})
 	}
 }
@@ -339,10 +339,10 @@ func Test_MeteringPointRevoke(t *testing.T) {
 	db, err := GetDB(context.Background())
 	require.NoError(t, err)
 
-	err = db.MeteringPointRevoke("TE000015", "AT0030000000000000000000000153013", consentEnd)
+	err = db.MeteringPointRevoke(context.Background(), "TE000015", "AT0030000000000000000000000153013", consentEnd)
 	assert.NoError(t, err)
 
-	meters, err := db.FindInactiveMeteringById("TE000015", "AT0030000000000000000000000153013")
+	meters, err := db.FindInactiveMeteringById(context.Background(), "TE000015", "AT0030000000000000000000000153013")
 	assert.NoError(t, err)
 	require.NotNil(t, meters)
 	require.Equal(t, 1, len(meters))
@@ -352,11 +352,11 @@ func Test_MeteringPointRevoke(t *testing.T) {
 	assert.Equal(t, consentEnd, meter.State.InactiveSince.Date)
 	assert.Equal(t, model.S_INACTIVE, meter.Status)
 
-	meters, err = db.FindActiveMeteringByIds("TE000015", []string{"AT0030000000000000000000000153013"})
+	meters, err = db.FindActiveMeteringByIds(context.Background(), "TE000015", []string{"AT0030000000000000000000000153013"})
 	assert.NoError(t, err)
 	require.Nil(t, meters)
 
-	meters, err = db.FindInactiveMeteringById("TE000015", "AT0030000000000000000000000153013")
+	meters, err = db.FindInactiveMeteringById(context.Background(), "TE000015", "AT0030000000000000000000000153013")
 	assert.NoError(t, err)
 	require.NotNil(t, meters)
 	require.Equal(t, 1, len(meters))
@@ -369,7 +369,7 @@ func Test_GetMeteringsByIds(t *testing.T) {
 	db, err := GetDB(context.Background())
 	require.NoError(t, err)
 
-	meters, err := db.FindActiveMeteringByIds("TE000015", []string{"AT0030000000000000000000000153012"})
+	meters, err := db.FindActiveMeteringByIds(context.Background(), "TE000015", []string{"AT0030000000000000000000000153012"})
 	assert.NoError(t, err)
 	require.NotNil(t, meters)
 	require.Equal(t, 1, len(meters))
@@ -377,7 +377,7 @@ func Test_GetMeteringsByIds(t *testing.T) {
 
 	require.Equal(t, null.StringFrom("123456789015"), meter.ConsentId)
 
-	meters, err = db.FindActiveMeteringByIds("TE000015", []string{"AT0030000000000000000000000153014"})
+	meters, err = db.FindActiveMeteringByIds(context.Background(), "TE000015", []string{"AT0030000000000000000000000153014"})
 	assert.NoError(t, err)
 	require.NotNil(t, meters)
 	require.Equal(t, 1, len(meters))
@@ -385,7 +385,7 @@ func Test_GetMeteringsByIds(t *testing.T) {
 
 	require.Equal(t, null.StringFrom("12345678901415"), meter.ConsentId)
 
-	meters, err = db.FindActiveMeteringByIds("TE000017", []string{"AT0030000000000000000000000153013"})
+	meters, err = db.FindActiveMeteringByIds(context.Background(), "TE000017", []string{"AT0030000000000000000000000153013"})
 	assert.NoError(t, err)
 	require.NotNil(t, meters)
 	require.Equal(t, 1, len(meters))
@@ -409,7 +409,7 @@ func Test_AddMultipleMeteringPoints(t *testing.T) {
 	require.NoError(t, err)
 
 	// Register new Meteringpoint
-	err = db.RegisterMeteringPoint("TE000001", "test", "ea9942da-03da-11ee-b82b-5a985b4b033a", meter)
+	err = db.RegisterMeteringPoint(context.Background(), "TE000001", "test", "ea9942da-03da-11ee-b82b-5a985b4b033a", meter)
 	require.NoError(t, err)
 
 	newParticipant := &model.EegParticipant{
@@ -437,31 +437,31 @@ func Test_AddMultipleMeteringPoints(t *testing.T) {
 	}
 
 	// Try to register new Participant with already registerd meteringpoint -> should fail
-	err = db.RegisterParticipant("TE000001", "test", newParticipant)
+	err = db.RegisterParticipant(context.Background(), "TE000001", "test", newParticipant)
 	require.Error(t, err)
 
 	// Send Revoke message to inactive meteringpoint
 	consentEnd := civil.Today().Add(24 * time.Hour)
-	err = db.MeteringPointRevoke("TE000001", meter.MeteringPoint, consentEnd)
+	err = db.MeteringPointRevoke(context.Background(), "TE000001", meter.MeteringPoint, consentEnd)
 	assert.NoError(t, err)
 
-	err = db.RegisterParticipant("TE000001", "test", newParticipant)
+	err = db.RegisterParticipant(context.Background(), "TE000001", "test", newParticipant)
 	require.NoError(t, err)
 
 	consentEnd = civil.Today().Add(24 * time.Hour)
-	err = db.MeteringPointRevoke("TE000001", meter.MeteringPoint, consentEnd)
+	err = db.MeteringPointRevoke(context.Background(), "TE000001", meter.MeteringPoint, consentEnd)
 	assert.NoError(t, err)
 
 	// Register new participant with revoked meteringpoint
 	newParticipant.FirstName = "Paula"
-	err = db.RegisterParticipant("TE000001", "test", newParticipant)
+	err = db.RegisterParticipant(context.Background(), "TE000001", "test", newParticipant)
 	require.NoError(t, err)
 
 	var names []string
 	stmt, _, err := pgDialect.From("base.meteringpoint").Select("metering_point_id").
 		Where(goqu.C("metering_point_id").Eq(meter.MeteringPoint)).ToSQL()
 	fmt.Printf("STMT: %v\n", stmt)
-	err = db.Select(&names, stmt)
+	err = db.Select(context.Background(), &names, stmt)
 	require.NoError(t, err)
 	require.Equal(t, 3, len(names))
 
@@ -474,7 +474,7 @@ func Test_AddMultipleMeteringPoints(t *testing.T) {
 		return nil
 	}
 
-	p, err := db.GetParticipants("TE000001")
+	p, err := db.GetParticipants(context.Background(), "TE000001")
 	require.NoError(t, err)
 
 	assert.Equal(t, 3, len(p))
@@ -565,7 +565,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		db, err := GetDB(context.Background())
 		require.NoError(t, err)
 
-		p, err := db.GetParticipants("TE000004")
+		p, err := db.GetParticipants(context.Background(), "TE000004")
 		require.NoError(t, err)
 
 		pUnderTest := findParticipantUnderTest(p, l)
@@ -583,7 +583,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		{
 			name: "Insert Participant",
 			test: func(t *testing.T) error {
-				err = db.RegisterParticipant("TE000004", "test", newParticipant)
+				err = db.RegisterParticipant(context.Background(), "TE000004", "test", newParticipant)
 				require.NoError(t, err)
 				return nil
 			},
@@ -601,13 +601,13 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		{
 			name: "Confirm Participant",
 			test: func(t *testing.T) error {
-				p, err := db.GetParticipants("TE000004")
+				p, err := db.GetParticipants(context.Background(), "TE000004")
 				require.NoError(t, err)
 
 				pUnderTest := findParticipantUnderTest(p, "TestUser1")
 				require.NotNil(t, pUnderTest)
 
-				return db.ConfirmParticipant("test", pUnderTest.Id.String())
+				return db.ConfirmParticipant(context.Background(), "TE000004", "test", pUnderTest.Id.String())
 			},
 			valid: func(t *testing.T) {
 				pUnderTest := getParticipantUnderTest(t, "TestUser1")
@@ -619,13 +619,13 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		{
 			name: "Add same Metering point",
 			test: func(t *testing.T) error {
-				p, err := db.GetParticipants(tenant)
+				p, err := db.GetParticipants(context.Background(), tenant)
 				require.NoError(t, err)
 
 				pUnderTest := findParticipantUnderTest(p, "TestUser1")
 				require.NotNil(t, pUnderTest)
 
-				err = db.RegisterMeteringPoint(tenant, "test", pUnderTest.Id.String(), meter)
+				err = db.RegisterMeteringPoint(context.Background(), tenant, "test", pUnderTest.Id.String(), meter)
 				require.Error(t, err)
 
 				return nil
@@ -637,7 +637,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 			test: func(t *testing.T) error {
 				now := civil.Today()
 				consentId := "1234567890"
-				return db.MeteringPointsSetStatus(tenant, model.ACTIVE, nil, []string{meter.MeteringPoint}, &now, &consentId)
+				return db.MeteringPointsSetStatus(context.Background(), tenant, model.ACTIVE, nil, []string{meter.MeteringPoint}, &now, &consentId)
 			},
 			valid: func(t *testing.T) {
 				pUnderTest := getParticipantUnderTest(t, "TestUser1")
@@ -652,7 +652,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		{
 			name: "Try new participant with same metering point",
 			test: func(t *testing.T) error {
-				err = db.RegisterParticipant(tenant, "test", secondParticipant)
+				err = db.RegisterParticipant(context.Background(), tenant, "test", secondParticipant)
 				require.Error(t, err)
 				return nil
 			},
@@ -661,7 +661,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		{
 			name: "Revoke Metering Point",
 			test: func(t *testing.T) error {
-				return db.MeteringPointRevoke(
+				return db.MeteringPointRevoke(context.Background(), 
 					tenant,
 					meter.MeteringPoint,
 					civil.Today(),
@@ -681,12 +681,12 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		{
 			name: "Add new Participant with same Meter",
 			test: func(t *testing.T) error {
-				err = db.RegisterParticipant(tenant, "test", secondParticipant)
+				err = db.RegisterParticipant(context.Background(), tenant, "test", secondParticipant)
 				require.NoError(t, err)
 
 				now := civil.Today().Add(2 * 24 * time.Hour)
 				consentId := "0987654321"
-				return db.MeteringPointsSetStatus(tenant, model.ACTIVE, nil, []string{meter.MeteringPoint}, &now, &consentId)
+				return db.MeteringPointsSetStatus(context.Background(), tenant, model.ACTIVE, nil, []string{meter.MeteringPoint}, &now, &consentId)
 			},
 			valid: func(t *testing.T) {
 				pUnderTest := getParticipantUnderTest(t, secondParticipant.LastName)
@@ -708,7 +708,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		{
 			name: "Revoke Metering Point Second Participant",
 			test: func(t *testing.T) error {
-				return db.MeteringPointRevoke("TE000004", meter.MeteringPoint, civil.Today().Add(6*24*time.Hour))
+				return db.MeteringPointRevoke(context.Background(), "TE000004", meter.MeteringPoint, civil.Today().Add(6*24*time.Hour))
 			},
 			valid: func(t *testing.T) {
 				pUnderTest := getParticipantUnderTest(t, "TestUser2")
@@ -723,7 +723,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		{
 			name: "Reactive Metering Point (PENDING)",
 			test: func(t *testing.T) error {
-				return db.MeteringPointsSetStatus(tenant, model.PENDING, nil, []string{meter.MeteringPoint}, nil, nil)
+				return db.MeteringPointsSetStatus(context.Background(), tenant, model.PENDING, nil, []string{meter.MeteringPoint}, nil, nil)
 			},
 			valid: func(t *testing.T) {
 				pUnderTest := getParticipantUnderTest(t, "TestUser2")
@@ -738,7 +738,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		{
 			name: "Reactive Metering Point (APPROVED)",
 			test: func(t *testing.T) error {
-				return db.MeteringPointsSetStatus(tenant, model.APPROVED, nil, []string{meter.MeteringPoint}, nil, nil)
+				return db.MeteringPointsSetStatus(context.Background(), tenant, model.APPROVED, nil, []string{meter.MeteringPoint}, nil, nil)
 			},
 			valid: func(t *testing.T) {
 				pUnderTest := getParticipantUnderTest(t, secondParticipant.LastName)
@@ -755,7 +755,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 			test: func(t *testing.T) error {
 				now := civil.Today().Add(8 * 24 * time.Hour)
 				consentId := "1234567890"
-				return db.MeteringPointsSetStatus(tenant, model.ACTIVE, nil, []string{meter.MeteringPoint}, &now, &consentId)
+				return db.MeteringPointsSetStatus(context.Background(), tenant, model.ACTIVE, nil, []string{meter.MeteringPoint}, &now, &consentId)
 			},
 			valid: func(t *testing.T) {
 				pUnderTest := getParticipantUnderTest(t, secondParticipant.LastName)
@@ -772,7 +772,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 			test: func(t *testing.T) error {
 				now := civil.Today().Add(8 * 24 * time.Hour)
 				consentId := "1234567891"
-				return db.MeteringPointsSetStatus(tenant, model.APPROVED, nil, []string{meter.MeteringPoint}, &now, &consentId)
+				return db.MeteringPointsSetStatus(context.Background(), tenant, model.APPROVED, nil, []string{meter.MeteringPoint}, &now, &consentId)
 			},
 			valid: func(t *testing.T) {
 				pUnderTest := getParticipantUnderTest(t, secondParticipant.LastName)
@@ -833,7 +833,7 @@ func Test_ActivateRevokedMeteringPoint(t *testing.T) {
 	require.NoError(t, err)
 
 	findParticipantUnderTest := func(t *testing.T, tenant, f, l string) *model.EegParticipant {
-		ps, err := db.GetParticipants(tenant)
+		ps, err := db.GetParticipants(context.Background(), tenant)
 		require.NoError(t, err)
 		for _, p := range ps {
 			if p.FirstName == f && p.LastName == l {
@@ -845,7 +845,7 @@ func Test_ActivateRevokedMeteringPoint(t *testing.T) {
 	}
 
 	// Try to register new Participant with already registerd meteringpoint -> should not fail
-	err = db.RegisterParticipant("TE000004", "test", newParticipant)
+	err = db.RegisterParticipant(context.Background(), "TE000004", "test", newParticipant)
 	require.NoError(t, err)
 
 	pUnderTest := findParticipantUnderTest(t, "TE000004", "Michael", "Obermüller")
@@ -859,7 +859,7 @@ func Test_ActivateRevokedMeteringPoint(t *testing.T) {
 
 	// Send Revoke message to inactive meteringpoint
 	consentEnd := civil.Today()
-	err = db.MeteringPointRevoke("TE000004", meter.MeteringPoint, consentEnd)
+	err = db.MeteringPointRevoke(context.Background(), "TE000004", meter.MeteringPoint, consentEnd)
 	assert.NoError(t, err)
 
 	p := findParticipantUnderTest(t, "TE000004", "Michael", "Obermüller")
@@ -870,7 +870,7 @@ func Test_ActivateRevokedMeteringPoint(t *testing.T) {
 	assert.Nil(t, p.MeteringPoint[0].State.ActiveSince.Ptr())
 
 	now := civil.Today()
-	err = db.MeteringPointsSetStatus("TE000004", model.ACTIVE, nil, []string{meter.MeteringPoint}, &now, nil)
+	err = db.MeteringPointsSetStatus(context.Background(), "TE000004", model.ACTIVE, nil, []string{meter.MeteringPoint}, &now, nil)
 	require.NoError(t, err)
 
 	p = findParticipantUnderTest(t, "TE000004", "Michael", "Obermüller")
@@ -929,19 +929,19 @@ func Test_RegistrationProcess(t *testing.T) {
 	db, err := GetDB(context.Background())
 
 	// Try to register new Participant with already registerd meteringpoint -> should fail
-	err = db.RegisterParticipant("TE000004", "test", newParticipant)
+	err = db.RegisterParticipant(context.Background(), "TE000004", "test", newParticipant)
 
-	pp, err := db.GetParticipants("TE000004")
+	pp, err := db.GetParticipants(context.Background(), "TE000004")
 	require.NoError(t, err)
 	assert.Less(t, 0, len(pp))
 
 	pUnderTest := findParticipantUnderTest(pp)
 	require.NotNil(t, pUnderTest)
 
-	err = db.ConfirmParticipant("test", pUnderTest.Id.String())
+	err = db.ConfirmParticipant(context.Background(), "TE000004", "test", pUnderTest.Id.String())
 	require.NoError(t, err)
 
-	pp, err = db.GetParticipants("TE000004")
+	pp, err = db.GetParticipants(context.Background(), "TE000004")
 	require.NoError(t, err)
 	assert.Less(t, 0, len(pp))
 
@@ -957,22 +957,22 @@ func Test_RegistrationProcess(t *testing.T) {
 	require.Nil(t, pUnderTest.MeteringPoint[0].State.ActiveSince.Ptr())
 
 	now := civil.Today()
-	err = db.MeteringPointsSetStatus("TE000004", model.PENDING, nil, []string{meter.MeteringPoint}, &now, nil)
+	err = db.MeteringPointsSetStatus(context.Background(), "TE000004", model.PENDING, nil, []string{meter.MeteringPoint}, &now, nil)
 	require.NoError(t, err)
 
-	m, err := db.FindMeteringByStatus("TE000004", meter.MeteringPoint, model.S_INIT)
+	m, err := db.FindMeteringByStatus(context.Background(), "TE000004", meter.MeteringPoint, model.S_INIT)
 	require.NoError(t, err)
 	assert.Equal(t, model.PENDING, m.ProcessState)
 
-	err = db.MeteringPointsSetStatus("TE000004", model.APPROVED, nil, []string{meter.MeteringPoint}, &now, nil)
+	err = db.MeteringPointsSetStatus(context.Background(), "TE000004", model.APPROVED, nil, []string{meter.MeteringPoint}, &now, nil)
 	require.NoError(t, err)
-	m, err = db.FindMeteringByStatus("TE000004", meter.MeteringPoint, model.S_INIT)
+	m, err = db.FindMeteringByStatus(context.Background(), "TE000004", meter.MeteringPoint, model.S_INIT)
 	require.NoError(t, err)
 	assert.Equal(t, model.APPROVED, m.ProcessState)
 
-	err = db.MeteringPointsSetStatus("TE000004", model.ACTIVE, nil, []string{meter.MeteringPoint}, &now, nil)
+	err = db.MeteringPointsSetStatus(context.Background(), "TE000004", model.ACTIVE, nil, []string{meter.MeteringPoint}, &now, nil)
 	require.NoError(t, err)
-	m, err = db.FindMeteringByStatus("TE000004", meter.MeteringPoint, model.S_ACTIVE)
+	m, err = db.FindMeteringByStatus(context.Background(), "TE000004", meter.MeteringPoint, model.S_ACTIVE)
 	require.NoError(t, err)
 	assert.Equal(t, model.ACTIVE, m.ProcessState)
 	assert.Equal(t, civil.Today(), m.RegisteredSince)
@@ -997,10 +997,10 @@ func Test_UpdateMeteringPoint(t *testing.T) {
 
 	expectedRegistrationDate := civil.DateFor(2023, 8, 16)
 	expectedactiveDate := civil.DateFor(2023, 1, 1)
-	err = db.UpdateMeteringPoint("TE000002", "test", "ea9942db-03da-11ee-b82b-5a985b4b033a", m.MeteringPoint, &m)
+	err = db.UpdateMeteringPoint(context.Background(), "TE000002", "test", "ea9942db-03da-11ee-b82b-5a985b4b033a", m.MeteringPoint, &m)
 	require.NoError(t, err)
 
-	mUnderTest, err := db.FindMeteringById("TE000002", "AT0030000000000000000000030041724")
+	mUnderTest, err := db.FindMeteringById(context.Background(), "TE000002", "AT0030000000000000000000030041724")
 	require.NoError(t, err)
 
 	require.Equal(t, expectedRegistrationDate, mUnderTest.RegisteredSince)
@@ -1030,7 +1030,7 @@ func Test_MeteringPointChangePartFact(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.wantErr(t, db.MeteringPointChangePartFactor(tt.args.tenant, tt.args.meters), fmt.Sprintf("MeteringPointChangePartFact(%v, %v)", tt.args.tenant, tt.args.meters))
+			tt.wantErr(t, db.MeteringPointChangePartFactor(context.Background(), tt.args.tenant, tt.args.meters), fmt.Sprintf("MeteringPointChangePartFact(%v, %v)", tt.args.tenant, tt.args.meters))
 		})
 	}
 }
@@ -1118,10 +1118,10 @@ func Test_UpdateMeteringPoints(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 
-			err = db.UpdateActiveMeteringPoints("TE000005", tt.testObject.MeterList)
+			err = db.UpdateActiveMeteringPoints(context.Background(), "TE000005", tt.testObject.MeterList)
 			require.NoError(t, err)
 
-			mUnderTest, err := db.FindMeteringByStatus("TE000005", "AT0030000000000000000000000003013", model.S_ACTIVE)
+			mUnderTest, err := db.FindMeteringByStatus(context.Background(), "TE000005", "AT0030000000000000000000000003013", model.S_ACTIVE)
 			require.NoError(t, err)
 
 			tt.validate(t, mUnderTest)
@@ -1133,7 +1133,7 @@ func TestFindMeteringPointsForTenant(t *testing.T) {
 	db, err := GetDB(context.Background())
 	require.NoError(t, err)
 
-	meters, err := db.FindMeteringPointsForTenant("TE000002")
+	meters, err := db.FindMeteringPointsForTenant(context.Background(), "TE000002")
 	require.NoError(t, err)
 	require.Equal(t, 5, len(meters))
 
@@ -1196,7 +1196,7 @@ func TestFindMeteringPointsActivePeriod(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			meters, err := db.FindMeteringPointsActivePeriod("TE001006", tt.args.from, tt.args.to)
+			meters, err := db.FindMeteringPointsActivePeriod(context.Background(), "TE001006", tt.args.from, tt.args.to)
 			require.NoError(t, err)
 			tt.validate(t, meters)
 		})
@@ -1218,16 +1218,16 @@ func TestMeteringPointRevokeByConsentId_INIT(t *testing.T) {
 	consentEnd := civil.DateOf(time.UnixMilli(m.ConsentEnd))
 	fmt.Printf("Consent-End: %+s\n", consentEnd)
 
-	tenant, err := db.MeteringPointRevokeByConsentId(&consentId, meterId, consentEnd)
+	tenant, err := db.MeteringPointRevokeByConsentId(context.Background(), &consentId, meterId, consentEnd)
 	require.NoError(t, err)
 	require.NotNil(t, tenant)
 	require.Equal(t, "TE100201", *tenant)
 
-	meters, err := db.FindInactiveMeteringById("TE100201", meterId)
+	meters, err := db.FindInactiveMeteringById(context.Background(), "TE100201", meterId)
 	require.NoError(t, err)
 	require.Equal(t, 0, len(meters))
 
-	meters, err = db.FindNewMeteringById("TE100201", meterId)
+	meters, err = db.FindNewMeteringById(context.Background(), "TE100201", meterId)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(meters))
 
@@ -1256,16 +1256,16 @@ func TestMeteringPointRevokeByConsentId_ACTIVE(t *testing.T) {
 	consentEnd := civil.DateOf(time.UnixMilli(m.ConsentEnd))
 	fmt.Printf("Consent-End: %+s\n", consentEnd)
 
-	tenant, err := db.MeteringPointRevokeByConsentId(&consentId, meterId, consentEnd)
+	tenant, err := db.MeteringPointRevokeByConsentId(context.Background(), &consentId, meterId, consentEnd)
 	require.NoError(t, err)
 	require.NotNil(t, tenant)
 	require.Equal(t, "TE100201", *tenant)
 
-	meters, err := db.FindNewMeteringById("TE100201", meterId)
+	meters, err := db.FindNewMeteringById(context.Background(), "TE100201", meterId)
 	require.NoError(t, err)
 	require.Equal(t, 0, len(meters))
 
-	meters, err = db.FindInactiveMeteringById("TE100201", meterId)
+	meters, err = db.FindInactiveMeteringById(context.Background(), "TE100201", meterId)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(meters))
 
@@ -1294,24 +1294,24 @@ func TestRemoveMeteringPoint(t *testing.T) {
 	require.NoError(t, err)
 
 	// Register new Meteringpoint
-	err = db.RegisterMeteringPoint("TE000001", "test", "ea9942da-03da-11ee-b82b-5a985b4b033a", meter)
+	err = db.RegisterMeteringPoint(context.Background(), "TE000001", "test", "ea9942da-03da-11ee-b82b-5a985b4b033a", meter)
 	require.NoError(t, err)
 
-	m, err := db.FindMeteringByStatus("TE000001", "AT0030000000000000000000030000999", model.S_INIT)
-	require.NoError(t, err)
-	require.NotNil(t, m)
-
-	assert.NoError(t, db.MeteringPointsSetStatus("TE000001", model.REVOKED, nil, []string{"AT0030000000000000000000030000999"}, nil, nil))
-	assert.NoError(t, db.RemoveMeteringPoint("TE000001", "ea9942da-03da-11ee-b82b-5a985b4b033a", "AT0030000000000000000000030000999"))
-
-	m, err = db.FindMeteringByStatus("TE000001", "AT0030000000000000000000030000999", model.S_INIT)
+	m, err := db.FindMeteringByStatus(context.Background(), "TE000001", "AT0030000000000000000000030000999", model.S_INIT)
 	require.NoError(t, err)
 	require.NotNil(t, m)
 
-	assert.NoError(t, db.MeteringPointsSetStatus("TE000001", model.INVALID, nil, []string{"AT0030000000000000000000030000999"}, nil, nil))
-	assert.NoError(t, db.RemoveMeteringPoint("TE000001", "ea9942da-03da-11ee-b82b-5a985b4b033a", "AT0030000000000000000000030000999"))
+	assert.NoError(t, db.MeteringPointsSetStatus(context.Background(), "TE000001", model.REVOKED, nil, []string{"AT0030000000000000000000030000999"}, nil, nil))
+	assert.NoError(t, db.RemoveMeteringPoint(context.Background(), "TE000001", "ea9942da-03da-11ee-b82b-5a985b4b033a", "AT0030000000000000000000030000999"))
 
-	m, err = db.FindMeteringByStatus("TE000001", "AT0030000000000000000000030000999", model.S_INIT)
+	m, err = db.FindMeteringByStatus(context.Background(), "TE000001", "AT0030000000000000000000030000999", model.S_INIT)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+
+	assert.NoError(t, db.MeteringPointsSetStatus(context.Background(), "TE000001", model.INVALID, nil, []string{"AT0030000000000000000000030000999"}, nil, nil))
+	assert.NoError(t, db.RemoveMeteringPoint(context.Background(), "TE000001", "ea9942da-03da-11ee-b82b-5a985b4b033a", "AT0030000000000000000000030000999"))
+
+	m, err = db.FindMeteringByStatus(context.Background(), "TE000001", "AT0030000000000000000000030000999", model.S_INIT)
 	require.Error(t, err)
 	require.Nil(t, m)
 }

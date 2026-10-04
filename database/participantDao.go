@@ -5,6 +5,7 @@ import (
 	dbsql "database/sql"
 	"errors"
 	"fmt"
+	"os"
 
 	"strings"
 
@@ -21,24 +22,27 @@ import (
 
 type ParticipantRepository interface {
 	GetParticipants(ctx context.Context, tenant string) ([]*model.EegParticipant, error)
-	GetParticipant(ctx context.Context, participantId string) (*model.EegParticipant, error)
+	GetParticipant(ctx context.Context, tenant, participantId string) (*model.EegParticipant, error)
 	GetParticipantByName(ctx context.Context, tenant string, email string) ([]*model.EegParticipant, error)
-	ConfirmParticipant(ctx context.Context, username, participantId string) error
+	ConfirmParticipant(ctx context.Context, tenant, username, participantId string) error
 	RegisterParticipant(ctx context.Context, tenant, username string, participant *model.EegParticipant) error
-	QueryParticipant(ctx context.Context, participantId string) (*model.EegParticipant, error)
+	QueryParticipant(ctx context.Context, tenant, participantId string) (*model.EegParticipant, error)
 	ImportParticipant(ctx context.Context, tenant, username string, participant *model.EegParticipant) error
 	FindParticipantByMeteringPoint(ctx context.Context, tenant, meteringPoint string) (*model.EegParticipant, error)
 	UpdateParticipant(ctx context.Context, tenant, user string, participant *model.EegParticipant) error
-	UpdateParticipantPartial(ctx context.Context, participantId, name string, value interface{}) error
+	UpdateParticipantPartial(ctx context.Context, tenant, participantId, name string, value interface{}) error
 	UpdateParticipantValues(ctx context.Context, participantId, tenant string, values map[string]string) error
-	DeleteParticipant(ctx context.Context, participantId string) error
+	DeleteParticipant(ctx context.Context, tenant, participantId string) error
 }
 
 func (db *sqlDatabase) GetParticipants(ctx context.Context, tenant string) ([]*model.EegParticipant, error) {
 	return getParticipants(ctx, db.db, tenant)
 }
 
-func (db *sqlDatabase) GetParticipant(ctx context.Context, participantId string) (*model.EegParticipant, error) {
+func (db *sqlDatabase) GetParticipant(ctx context.Context, tenant, participantId string) (*model.EegParticipant, error) {
+	if err := assertParticipantTenant(ctx, db.db, tenant, participantId); err != nil {
+		return nil, err
+	}
 	return getParticipant(ctx, db.db, participantId)
 }
 
@@ -59,11 +63,17 @@ func (db *sqlDatabase) RegisterParticipant(ctx context.Context, tenant, username
 	return tx.Commit()
 }
 
-func (db *sqlDatabase) ConfirmParticipant(ctx context.Context, username, participantId string) error {
+func (db *sqlDatabase) ConfirmParticipant(ctx context.Context, tenant, username, participantId string) error {
+	if err := assertParticipantTenant(ctx, db.db, tenant, participantId); err != nil {
+		return err
+	}
 	return confirmParticipant(ctx, db.db, username, participantId)
 }
 
-func (db *sqlDatabase) QueryParticipant(ctx context.Context, participantId string) (*model.EegParticipant, error) {
+func (db *sqlDatabase) QueryParticipant(ctx context.Context, tenant, participantId string) (*model.EegParticipant, error) {
+	if err := assertParticipantTenant(ctx, db.db, tenant, participantId); err != nil {
+		return nil, err
+	}
 	return queryParticipant(ctx, db.db, participantId)
 }
 
@@ -88,7 +98,10 @@ func (db *sqlDatabase) UpdateParticipant(ctx context.Context, tenant, user strin
 	return updateParticipant(ctx, db.db, tenant, user, participant)
 }
 
-func (db *sqlDatabase) UpdateParticipantPartial(ctx context.Context, participantId, name string, value interface{}) error {
+func (db *sqlDatabase) UpdateParticipantPartial(ctx context.Context, tenant, participantId, name string, value interface{}) error {
+	if err := assertParticipantTenant(ctx, db.db, tenant, participantId); err != nil {
+		return err
+	}
 	return updateParticipantPartial(ctx, db.db, participantId, name, value)
 }
 
@@ -102,11 +115,71 @@ func (db *sqlDatabase) UpdateParticipantValues(ctx context.Context, participantI
 	return nil
 }
 
-func (db *sqlDatabase) DeleteParticipant(ctx context.Context, participantId string) error {
+func (db *sqlDatabase) DeleteParticipant(ctx context.Context, tenant, participantId string) error {
+	if err := assertParticipantTenant(ctx, db.db, tenant, participantId); err != nil {
+		return err
+	}
 	return deleteParticipant(ctx, db.db, participantId)
 }
 
 const TABLE_PARTICIPANT = "base.participant"
+
+// enforceParticipantTenant steuert, ob ein Zugriff auf einen fremden Teilnehmer
+// abgewiesen (true, Standard) oder nur protokolliert wird (false).
+//
+// Die Abfragen auf einen einzelnen Teilnehmer liefen frueher ausschliesslich ueber
+// die ID, ohne den aus dem Token geprueften Mandanten. Wer eine fremde ID kannte,
+// konnte den Datensatz lesen, aendern oder loeschen — samt Bankverbindung und
+// Adressen. Die IDs sind zudem zeitbasiert (uuid.NewUUID), auf ihre Unkenntnis ist
+// also kein Verlass.
+//
+// Fuer eine schrittweise Einfuehrung laesst sich die Abweisung mit
+// PARTICIPANT_TENANT_ENFORCE=false voruebergehend abschalten; dann wird der
+// Fremdzugriff nur geloggt und man sieht vor dem Scharfschalten, wen es traefe.
+var enforceParticipantTenant = os.Getenv("PARTICIPANT_TENANT_ENFORCE") != "false"
+
+// assertParticipantTenant stellt sicher, dass der Teilnehmer zur Gemeinschaft des
+// Aufrufers gehoert. Bewusst als Vorabpruefung statt als zusaetzliche WHERE-Bedingung:
+// updateParticipantPartial schreibt auch in Kindtabellen (Adressen, Kontakt), dort
+// waere ein durchgereichter Mandant leicht zu uebersehen.
+func assertParticipantTenant(ctx context.Context, db *sqlx.DB, tenant, participantId string) error {
+	if tenant == "" {
+		return model.ErrForeignTenantParticipant(errors.New("no tenant in request context"))
+	}
+
+	stmt, _, err := pgDialect.From(TABLE_PARTICIPANT).
+		Select("tenant").
+		Where(goqu.Ex{"id": participantId}).
+		ToSQL()
+	if err != nil {
+		return model.ErrGetParticipant(err)
+	}
+
+	var owner string
+	if err := db.GetContext(ctx, &owner, stmt); err != nil {
+		if errors.Is(err, dbsql.ErrNoRows) {
+			// Nicht vorhanden - die aufrufende Funktion meldet das wie bisher.
+			return nil
+		}
+		return model.ErrGetParticipant(err)
+	}
+
+	if strings.EqualFold(owner, tenant) {
+		return nil
+	}
+
+	log.WithFields(log.Fields{
+		"tenant":        tenant,
+		"participantId": participantId,
+		"enforced":      enforceParticipantTenant,
+	}).Warn("cross-tenant participant access")
+
+	if enforceParticipantTenant {
+		return model.ErrForeignTenantParticipant(
+			fmt.Errorf("participant %s does not belong to tenant %s", participantId, tenant))
+	}
+	return nil
+}
 
 func getParticipants(ctx context.Context, db *sqlx.DB, tenant string) ([]*model.EegParticipant, error) {
 	var participants []*model.EegParticipant = []*model.EegParticipant{}
@@ -270,6 +343,17 @@ func enforceContactEmail(participant *model.EegParticipant) error {
 	return nil
 }
 
+// enforceAddressTypes stamps the row discriminator server-side. base.address
+// keeps both addresses of a member in one table and every read path joins on
+// type = 'RESIDENCE' / 'BILLING'. The column default never applies because
+// toRecord always writes the field, so a request without a residentAddress
+// block inserted a row with an empty type: invisible to every join, and the
+// update path matched nothing either. The discriminator is not user data.
+func enforceAddressTypes(participant *model.EegParticipant) {
+	participant.BillingAddress.Type = model.BILLING
+	participant.ResidentAddress.Type = model.RESIDENCE
+}
+
 func updateParticipant(ctx context.Context, db *sqlx.DB, tenant, user string, participant *model.EegParticipant) error {
 
 	if err := enforceContactEmail(participant); err != nil {
@@ -424,8 +508,12 @@ func saveParticipant(ctx context.Context, tx *sqlx.Tx, tenant, username string, 
 	if err := enforceContactEmail(participant); err != nil {
 		return err
 	}
+	enforceAddressTypes(participant)
 
-	participant.ParticipantSince = civil.NullDate{civil.Today(), true}
+	// "Mitglied seit" aus Import/Registrierung übernehmen; nur ohne Wert auf heute setzen.
+	if !participant.ParticipantSince.Valid {
+		participant.ParticipantSince = civil.NullDate{Date: civil.Today(), Valid: true}
+	}
 	registeringParticipant := struct {
 		model.EegParticipantBase
 		Tenant           string         `db:"tenant"`

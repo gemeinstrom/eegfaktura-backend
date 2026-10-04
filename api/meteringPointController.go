@@ -81,7 +81,7 @@ func (h *MeteringHandler) createMeteringPoint() middleware.JWTHandlerFunc {
 				return
 			}
 
-			participant, err := h.db.QueryParticipant(r.Context(), participantId)
+			participant, err := h.db.QueryParticipant(r.Context(), tenant, participantId)
 			if err != nil {
 				log.WithField("tenant", tenant).WithError(err).Error("failed to register metering point. Cannot find appropriate participant.")
 				respondWith(w, http.StatusBadRequest, tenant, err)
@@ -303,7 +303,7 @@ func (h *MeteringHandler) registerMeteringPoint() middleware.JWTHandlerFunc {
 			respondWith(w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
 			return
 		}
-		participant, err := h.db.QueryParticipant(r.Context(), participantId)
+		participant, err := h.db.QueryParticipant(r.Context(), tenant, participantId)
 		if err != nil {
 			log.WithField("tenant", tenant).WithError(err).Error("failed to register metering point.")
 			respondWith(w, http.StatusBadRequest, tenant, err)
@@ -443,7 +443,7 @@ func (h *MeteringHandler) requestRevokeMeteringPoint() middleware.JWTHandlerFunc
 			respondWith(w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
 			return
 		}
-		participant, err := h.db.QueryParticipant(r.Context(), participantId)
+		participant, err := h.db.QueryParticipant(r.Context(), tenant, participantId)
 		if err != nil {
 			log.WithField("tenant", tenant).WithError(err).Error("failed to revoke metering point.")
 			respondWith(w, http.StatusBadRequest, tenant, err)
