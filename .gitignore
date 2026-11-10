@@ -1,3 +1,3 @@
 /vfeeg-backend
-/proto/masterdata.pb.go
-/proto/masterdata_grpc.pb.go
+/proto/*.pb.go
+/model/registration_model.go

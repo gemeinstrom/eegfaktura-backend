@@ -129,6 +129,49 @@ const (
 	F_DELETED
 )
 
+// MemberActivityType is the status of a member derived from its metering points (platform#165).
+type MemberActivityType string
+
+const (
+	MemberActive   MemberActivityType = "ACTIVE"
+	MemberPending  MemberActivityType = "PENDING"
+	MemberInactive MemberActivityType = "INACTIVE"
+)
+
+// MemberActivity derives the member status from its metering points: ACTIVE with at least one active metering
+// point; PENDING without one but with one not yet active (status INIT) whose registration is running, or with no
+// metering point at all; INACTIVE when all of them have left, were archived or rejected. A metering point with status
+// INACTIVE never counts as registering: in prod (20.10.2026) 36 members have only such rows with a stale registration
+// state and could not be told apart from a re-registration; a re-registered one counts once it is active again.
+// The stored participant status is not changed.
+func MemberActivity(meters []*MeteringPoint) MemberActivityType {
+	if len(meters) == 0 {
+		return MemberPending
+	}
+	pending := false
+	for _, m := range meters {
+		if m.Status == S_ACTIVE {
+			return MemberActive
+		}
+		if m.Status != S_INACTIVE && registering(m.ProcessState) {
+			pending = true
+		}
+	}
+	if pending {
+		return MemberPending
+	}
+	return MemberInactive
+}
+
+// registering: the registration of the metering point is running (by its process state)
+func registering(p ProcessStatusType) bool {
+	switch p {
+	case NEW, INIT, PENDING, APPROVED:
+		return true
+	}
+	return false
+}
+
 type MeteringPoint struct {
 	MeteringPoint    string            `json:"meteringPoint" db:"metering_point_id" goqu:"skipupdate"`
 	ParticipantId    string            `json:"participantId,omitempty" db:"participant_id" goqu:"skipupdate,skipinsert"`
@@ -154,8 +197,10 @@ type MeteringPoint struct {
 	State            *MeterState       `json:"participantState" goqu:"skipupdate"`
 	PartFact         int               `json:"partFact,omitempty" db:"partFact" goqu:"skipupdate,skipinsert"`
 	ActivationMode   RegistrationMode  `json:"activationMode,omitempty" goqu:"skipupdate,skipinsert" db:"-"`
-	ActivationCode   string            `json:"activationCode,omitempty" goqu:"skipupdate,skipinsert" db:"-"`
 	AllocationFactor null.Float        `json:"allocationFactor,omitempty" db:"allocation_factor" goqu:"omitempty"`
+	// from the grid operator's metering point list (platform#229); read only
+	TechCode null.String `json:"techCode,omitempty" db:"tech_code" goqu:"skipinsert,skipupdate"`
+	FuelCode null.String `json:"fuelCode,omitempty" db:"fuel_code" goqu:"skipinsert,skipupdate"`
 }
 
 //type MeteringPointOffline struct {

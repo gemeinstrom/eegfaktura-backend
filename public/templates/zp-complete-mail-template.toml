@@ -1,4 +1,1 @@
 TemplateFile="zp-complete-mail-template.html"
-InlinePictures = [
-  { Filepath="eegfaktura-logo.png", contentId="eegfaktura-logo-1" }
-]

@@ -12,6 +12,8 @@ type NotificationProcess string
 const (
 	N_PROCESS_IMPORT_EXCEL NotificationProcess = "EXCEL_IMPORT"
 	N_PROCESS_EDA_PROCESS  NotificationProcess = "EDA_PROCESS"
+	// hidden rows of the energy request summary (platform#173), not listed in Messages
+	N_PROCESS_ENERGY_REQUEST NotificationProcess = "ENERGY_REQUEST"
 
 	N_TYPE_NOTIFICATION NotificationType = "NOTIFICATION"
 	N_TYPE_ERROR        NotificationType = "ERROR"

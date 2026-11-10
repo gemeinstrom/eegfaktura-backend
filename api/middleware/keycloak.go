@@ -88,7 +88,7 @@ func InitKeycloak() {
 		if err != nil {
 			panic(err)
 		}
-		logrus.Printf("Internal KEYCLOAK host: %s\n", u.Host)
+		logrus.WithContext(ctx).Printf("Internal KEYCLOAK host: %s\n", u.Host)
 		transport := &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -111,10 +111,10 @@ func InitKeycloak() {
 	providerUriApp := fmt.Sprintf("%s/realms/%s", hostApp, realmApp)
 	provider, err := oidc.NewProvider(ctx, providerUriApp)
 	if err != nil {
-		logrus.Errorf("E: %v", err)
+		logrus.WithContext(ctx).Errorf("E: %v", err)
 		panic(err)
 	}
-	verifier = provider.Verifier(&oidc.Config{ClientID: clientIDApp, SkipClientIDCheck: true})
+	verifier = provider.Verifier(&oidc.Config{ClientID: clientIDApp, SkipClientIDCheck: true, SupportedSigningAlgs: []string{oidc.RS256}})
 }
 
 func readKeycloakConfig() (map[string]*keycloakConfig, error) {
@@ -163,7 +163,7 @@ func NewKeycloakClient(issuer, clientID, clientSecret, issuerUrl string, client 
 	if err != nil {
 		return nil, err
 	}
-	kc.verifier = kc.oidc.Verifier(&oidc.Config{ClientID: clientID, SkipClientIDCheck: true})
+	kc.verifier = kc.oidc.Verifier(&oidc.Config{ClientID: clientID, SkipClientIDCheck: true, SupportedSigningAlgs: []string{oidc.RS256}})
 	return kc, nil
 }
 
@@ -172,23 +172,6 @@ type Credentials struct {
 	AccessToken  string `json:"access_token,omitempty"`
 	RefreshToken string `json:"refresh_token,omitempty"`
 	IssueUrl     string `json:"issue_url,omitempty"`
-}
-
-func (kc *KeycloakClient) Authenticate() (*httputil2.ClientCreds, error) {
-	resp, err := httputil2.PostFormUrlencoded(kc.client, kc.oidc.Endpoint().TokenURL, nil, map[string][]string{
-		"grant_type":    {"client_credentials"},
-		"client_id":     {kc.clientID},
-		"client_secret": {kc.clientSecret},
-	})
-	if err != nil {
-		return nil, err
-	}
-	creds := &httputil2.ClientCreds{}
-	if err = httputil2.DecodeJSONResponse(resp, creds); err != nil {
-		return nil, err
-	}
-	creds.SetExpiresTime()
-	return creds, nil
 }
 
 func (kc *KeycloakClient) AuthenticateUserWithPassword(username, password string) (token *oidc.IDToken, err error) {

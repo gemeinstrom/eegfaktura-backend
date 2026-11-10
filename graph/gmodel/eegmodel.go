@@ -26,11 +26,11 @@ func MarshalEeg(e model.Eeg) graphql.Marshaler {
 	return graphql.WriterFunc(func(w io.Writer) {
 		byteData, err := json.Marshal(e)
 		if err != nil {
-			log.Printf("FAIL WHILE MARSHAL JSON %v\n", string(byteData))
+			log.Printf("FAIL WHILE MARSHAL JSON %v\n", err)
 		}
 		_, err = w.Write(byteData)
 		if err != nil {
-			log.Printf("FAIL WHILE WRITE DATA %v\n", string(byteData))
+			log.Printf("FAIL WHILE WRITE DATA %v\n", err)
 		}
 	})
 }

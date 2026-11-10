@@ -7,7 +7,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/golang-jwt/jwt"
+	"at.ourproject/vfeeg-backend/logging"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/sirupsen/logrus"
 )
 
@@ -25,15 +26,11 @@ type PlatformClaims struct {
 	AccessGroups AccessGroups `json:"access_groups"`
 	Authorized   string       `json:"azp"`
 	RealmAccess  RealmRoles   `json:"realm_access"`
-	jwt.StandardClaims
+	jwt.RegisteredClaims
 }
 
 type RealmRoles struct {
 	Roles []string `json:"roles"`
-}
-
-func (rr RealmRoles) HasRole(role string) bool {
-	return hasRole(rr.Roles, role)
 }
 
 type AccessGroups []string
@@ -93,18 +90,18 @@ func GQLProtect(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		jwtToken, err := ParseBearerTokenFromHeader(r)
 		if err != nil {
-			logrus.Printf("No Access_token in request or invalid Authorization: %v\n", err)
+			logrus.WithContext(r.Context()).Printf("No Access_token in request or invalid Authorization: %v\n", err)
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
 
 		claims, err := verifyAndExtractClaims(context.Background(), jwtToken)
 		if err != nil {
-			logrus.WithField("error", "JWT-Token").Errorf("%v", err)
+			logrus.WithContext(r.Context()).WithError(err).Error("token verification failed")
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(err.Error()))
 			return
 		}
+		logging.SetClient(r.Context(), claims.Authorized)
 
 		//fmt.Printf("Claims: %+v\n", claims)
 		tenant := r.Header.Get("tenant")
@@ -114,18 +111,24 @@ func GQLProtect(next http.Handler) http.Handler {
 		superuser := hasRole(claims.RealmAccess.Roles, "superuser")
 		if !superuser {
 			if contains(claims.Tenants, tenant) == false {
-				logrus.WithField("tenant", tenant).Warnf("Unauthorized access with tenant %s", tenant)
+				logrus.WithContext(r.Context()).Warn("tenant check failed")
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
 		}
 
 		// put it in context
-		ctx := context.WithValue(
-			context.WithValue(r.Context(), tenantCtxKey, strings.ToUpper(tenant)),
-			superUserCtxKey, superuser)
+		ctx := context.WithValue(r.Context(), tenantCtxKey, strings.ToUpper(tenant))
 
-		logrus.Printf("Access granted for tenant %s (%s)", tenant, r.URL.Path)
+		// F1, step 1 (log only): REST write endpoints require the EEG_ADMIN group,
+		// /query does not check it yet. Tokens without it are only marked here and
+		// logged per operation by GQLAdminCheckLog; the request passes as before.
+		// Enforcing the role follows after the log period.
+		if !claims.AccessGroups.IsAdmin() {
+			ctx = withGQLNonAdmin(ctx, claims, superuser)
+		}
+
+		logging.SetTenant(ctx, tenant)
 		// and call the next with our new context
 		r = r.WithContext(ctx)
 		next.ServeHTTP(w, r)
@@ -135,15 +138,16 @@ func GQLProtect(next http.Handler) http.Handler {
 func retrieveClaims(r *http.Request) (string, *PlatformClaims, error) {
 	jwtToken, err := ParseBearerTokenFromHeader(r)
 	if err != nil {
-		logrus.WithField("error", "JWT-Token").Printf("No Access_token in request or invalid Authorization: %v\n", err)
+		logrus.WithContext(r.Context()).WithError(err).Info("no access token in the request or invalid Authorization header")
 		return "", nil, &VerifyError{http.StatusForbidden, errors.New("no access token available")}
 	}
 
 	claims, err := verifyAndExtractClaims(context.Background(), jwtToken)
 	if err != nil {
-		logrus.WithField("error", "JWT-Token").Errorf("%v", err)
+		logrus.WithContext(r.Context()).WithError(err).Error("token verification failed")
 		return "", nil, &VerifyError{http.StatusUnauthorized, err}
 	}
+	logging.SetClient(r.Context(), claims.Authorized)
 
 	tenant := r.Header.Get("tenant")
 	if len(tenant) == 0 {
@@ -152,7 +156,7 @@ func retrieveClaims(r *http.Request) (string, *PlatformClaims, error) {
 	superuser := hasRole(claims.RealmAccess.Roles, "superuser")
 	if !superuser {
 		if contains(claims.Tenants, tenant) == false {
-			logrus.WithField("tenant", tenant).Warnf("Unauthorized access with tenant %s", tenant)
+			logrus.WithContext(r.Context()).Warn("tenant check failed")
 			return tenant, nil, &VerifyError{http.StatusForbidden, errors.New("unauthorized access")}
 		}
 	}
@@ -180,31 +184,16 @@ func ConditionProtect(admin JWTHandlerFunc, user JWTHandlerFunc) http.HandlerFun
 
 		claims.Tenants = toUpper(claims.Tenants)
 		if claims.AccessGroups.IsAdmin() {
+			logging.SetTenant(r.Context(), tenant)
 			admin(w, r, claims, strings.ToUpper(tenant))
 		} else if claims.AccessGroups.IsUser() {
+			logging.SetTenant(r.Context(), tenant)
 			user(w, r, claims, strings.ToUpper(tenant))
 		} else {
 			w.WriteHeader(http.StatusUnauthorized)
 		}
 	}
 }
-
-//func UserMiddelware(handler TenantHandlerFunc) http.HandlerFunc {
-//	return func(w http.ResponseWriter, r *http.Request) {
-//
-//		tenant := r.Header.Get("X-Tenant")
-//		userId := r.Header.Get("X-User-ID")
-//		mail := r.Header.Get("X-Mail")
-//
-//		if len(tenant) <= 0 {
-//			logrus.WithField("tenant", tenant).Warn("unauthorized tenant")
-//			http.Error(w, "forbidden", http.StatusForbidden)
-//			return
-//		}
-//
-//		handler(w, r, &BackendClaims{Tenant: strings.ToUpper(tenant), UserId: userId, Mail: mail})
-//	}
-//}
 
 func Protect(handler JWTHandlerFunc) http.HandlerFunc {
 	return verifyRequest(handler)
@@ -214,7 +203,7 @@ func ProtectApi(handler JWTHandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		username, password, err := ParseBasicCredentialsFromHeader(r)
 		if err != nil {
-			logrus.WithField("error", err.Error()).Warn("invalid Authorization header (basic)")
+			logrus.WithContext(r.Context()).WithField("error", err.Error()).Warn("invalid Authorization header (basic)")
 			// Distinguish between missing header and invalid schema/encoding if needed
 			if errors.Is(err, ErrNoAuthorization) {
 				w.WriteHeader(http.StatusForbidden)
@@ -226,21 +215,32 @@ func ProtectApi(handler JWTHandlerFunc) http.HandlerFunc {
 
 		idToken, err := kcClientAPI.AuthenticateUserWithPassword(username, password)
 		if err != nil {
-			logrus.WithError(err).Error("authentication failed")
+			logrus.WithContext(r.Context()).WithError(err).Error("authentication failed")
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 
 		var claims PlatformClaims
 		if err := idToken.Claims(&claims); err != nil {
-			logrus.WithError(err).Error("failed to parse claims")
+			logrus.WithContext(r.Context()).WithError(err).Error("failed to parse claims")
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		logging.SetClient(r.Context(), claims.Authorized)
 
 		tenant := r.Header.Get("X-Tenant")
 		if !contains(claims.Tenants, tenant) {
-			logrus.WithField("tenant", tenant).Warn("unauthorized tenant")
+			logrus.WithContext(r.Context()).Warn("tenant check failed")
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		logging.SetTenant(r.Context(), tenant)
+
+		// Same admin-group requirement as the JWT path (verifyRequest): these
+		// endpoints expose member data and trigger EDA messages, so a plain
+		// EEG_USER must not reach them.
+		if !claims.AccessGroups.IsAdmin() {
+			logrus.WithContext(r.Context()).Warn("unauthorized access - request has no admin access group")
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -265,11 +265,12 @@ func verifyRequest(handler JWTHandlerFunc) func(w http.ResponseWriter, r *http.R
 			return
 		}
 
+		logging.SetTenant(r.Context(), tenant)
 		if claims.AccessGroups.IsAdmin() {
 			claims.Tenants = toUpper(claims.Tenants)
 			handler(w, r, claims, strings.ToUpper(tenant))
 		} else {
-			logrus.WithField("tenant", tenant).Warnf("Unauthorized access with tenant %s - Request has no admin access group", tenant)
+			logrus.WithContext(r.Context()).Warn("unauthorized access - request has no admin access group")
 			w.WriteHeader(http.StatusUnauthorized)
 		}
 	}

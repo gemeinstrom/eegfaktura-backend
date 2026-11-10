@@ -6,7 +6,7 @@ database:
   password: "postgresPW"
   dbname: "postgresdb"
   maxOpenConns: 20
-  maxIdleConns: 25
+  maxIdleConns: 20
   connMaxLifetime: "5m"
   statsLogInterval: "1m"
 
@@ -16,7 +16,6 @@ mqtt:
   qos: 1
 
 file-content:
-  basedir: "../../file-content/"
   templates: "./public"
 
 grpc-provider:
@@ -27,11 +26,22 @@ services:
 
 eda-process-versions:
   ANFORDERUNG_PT: "03.00"
-  ANFORDERUNG_ECON: "02.30"
-  ANFORDERUNG_ECOF: "02.20"
-  ANFORDERUNG_CPF: "01.00"
-  ANFORDERUNG_ECP: "02.00"
+  ANFORDERUNG_ECON: "02.40"
+  ANFORDERUNG_ECOF: "02.30"
+  ANFORDERUNG_CPF: "01.10"
+  ANFORDERUNG_ECP: "02.10"
   ANFORDERUNG_ECC: "01.20"
   ANFORDERUNG_CCMO: "01.20"
   ANFORDERUNG_GN: "03.12"
   AUFHEBUNG_CCMS: "01.30"
+
+# Grid operator numbers in metering point numbers that are only reachable under another
+# number (platform#107). Applied when a metering point is written; needs a restart.
+grid-operator-alias:
+  AT008200: AT008000   # Energienetze Steiermark (confirmed by the grid operator, 2026-08-07)
+  AT008230: AT008000
+  AT008320: AT008000
+  AT008380: AT008000
+  AT008480: AT008000
+  AT008830: AT008000
+  AT008960: AT008000

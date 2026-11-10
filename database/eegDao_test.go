@@ -2,11 +2,11 @@ package database
 
 import (
 	"at.ourproject/vfeeg-backend/model"
-	"github.com/jjeffery/civil"
 	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/jjeffery/civil"
 	"github.com/mitchellh/mapstructure"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,9 +17,8 @@ import (
 
 func TestNewDatabase(t *testing.T) {
 
-	ctx := context.Background()
-	db, err := GetDB(ctx)
-	require.NoError(t, err)
+	// asserts the seed data: on the untouched copy, other tests change TE000001
+	db := seedDB(t)
 
 	eeg, err := db.GetEegByEcId(context.Background(), "AT00300000000TC000001000000000001")
 	require.NoError(t, err)
@@ -34,8 +33,8 @@ func TestNewDatabase(t *testing.T) {
 }
 
 func TestGetEeg(t *testing.T) {
-	db, err := GetDB(context.Background())
-	require.NoError(t, err)
+	// asserts the seed data: on the untouched copy, other tests change TE000001
+	db := seedDB(t)
 
 	eeg, err := db.GetEegById(context.Background(), "TE000001")
 	assert.NoError(t, err)
@@ -83,14 +82,13 @@ func TestGetEeg(t *testing.T) {
 }
 
 func TestUpdateEeg(t *testing.T) {
-	mDB, mock, err := InitMockDatabase()
-	require.NoError(t, err)
+	mDB, mock := newMockDatabase(t)
 
 	eegJson := `{
             "id": "TE100100",
             "name": "T-VIERE",
             "businessNr": "123456789",
-            "area": "",
+            "area": "LOCAL",
             "legal": "verein",
             "operatorName": "Netz OOE",
             "communityId": "AT00300000000TC100100000000000001",
@@ -126,7 +124,7 @@ func TestUpdateEeg(t *testing.T) {
         }`
 
 	var eeg model.Eeg
-	err = json.NewDecoder(strings.NewReader(eegJson)).Decode(&eeg)
+	err := json.NewDecoder(strings.NewReader(eegJson)).Decode(&eeg)
 	assert.NoError(t, err)
 
 	type args struct {
@@ -146,6 +144,7 @@ func TestUpdateEeg(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			mock.ExpectQuery("SELECT EXISTS (.+)").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 			mock.ExpectExec("INSERT INTO (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
 			tt.wantErr(t, mDB.InsertEeg(context.Background(), tt.args.tenant, tt.args.eeg), fmt.Sprintf("InsertEeg(%v, %+v)", tt.args.tenant, tt.args.eeg))
 			assert.NoError(t, mock.ExpectationsWereMet())
@@ -235,22 +234,6 @@ func TestUpdateEegPartial1(t *testing.T) {
 			},
 		},
 		{
-			name:  "Set EEG Online true",
-			eeg:   "TE000001",
-			param: map[string]interface{}{"online": true},
-			test: func(t *testing.T, eeg *model.Eeg) {
-				assert.Equal(t, true, eeg.Online)
-			},
-		},
-		{
-			name:  "Set EEG Online false",
-			eeg:   "TE000001",
-			param: map[string]interface{}{"online": false},
-			test: func(t *testing.T, eeg *model.Eeg) {
-				assert.Equal(t, false, eeg.Online)
-			},
-		},
-		{
 			name:  "Set EEG IBAN",
 			eeg:   "TE000001",
 			param: map[string]interface{}{"iban": "AT11 1111 1111 1111 11"},
@@ -297,5 +280,173 @@ func TestUpdateEegPartial1(t *testing.T) {
 
 			tt.test(t, eeg)
 		})
+	}
+}
+
+// TestUpdateEegPartialDropsProtectedFields deckt F6 ab: der generische EEG-Update
+// darf geschuetzte Felder (tenant, rcNumber, online, communityId, settlementInterval, area, allocationMode) nicht setzen,
+// auch wenn der Client sie mitschickt (die Web schickt das ganze Objekt zurueck).
+func TestUpdateEegPartialDropsProtectedFields(t *testing.T) {
+	db, err := GetDB(context.Background())
+	require.NoError(t, err)
+
+	before, err := db.GetEegById(context.Background(), "TE000001")
+	require.NoError(t, err)
+
+	otherMode := model.STATIC
+	if before.AllocationMode == model.STATIC {
+		otherMode = model.DYNAMIC
+	}
+	require.NotEqual(t, model.P2P, before.Area, "fixture")
+
+	err = db.UpdateEegPartial(context.Background(), "TE000001", map[string]interface{}{
+		"description": "F6-probe",
+		"rcNumber":    "HIJACK",
+		"online":      true,
+		"communityId": "AT00000000000000000000000000HIJACK",
+		// only through ChangeSettlementInterval with its rule (konzept-abrechnungsintervall.md)
+		"settlementInterval": "ANNUAL",
+		// set at registration, otherwise only by the operator (platform#229, E5)
+		"area":           string(model.P2P),
+		"allocationMode": string(otherMode),
+	})
+	require.NoError(t, err)
+
+	after, err := db.GetEegById(context.Background(), "TE000001")
+	require.NoError(t, err)
+
+	assert.Equal(t, "F6-probe", after.Description, "normales Feld muss geaendert sein")
+	assert.Equal(t, before.RcNumber, after.RcNumber, "rcNumber darf nicht geaendert sein")
+	assert.Equal(t, before.CommunityId, after.CommunityId, "communityId darf nicht geaendert sein")
+	assert.Equal(t, before.Online, after.Online, "online darf nicht geaendert sein")
+	assert.Equal(t, before.SettlementInterval, after.SettlementInterval, "settlementInterval darf nicht geaendert sein")
+	assert.Equal(t, before.Area, after.Area, "area darf nicht geaendert sein")
+	assert.Equal(t, before.AllocationMode, after.AllocationMode, "allocationMode darf nicht geaendert sein")
+}
+
+// TestUpdateEegPartialRejectsUnknownField: ein unbekannter Schluessel wird als
+// SQL-Bezeichner verwendet und darf deshalb nicht durchgereicht werden.
+func TestUpdateEegPartialRejectsUnknownField(t *testing.T) {
+	db, err := GetDB(context.Background())
+	require.NoError(t, err)
+
+	before, err := db.GetEegById(context.Background(), "TE000001")
+	require.NoError(t, err)
+
+	err = db.UpdateEegPartial(context.Background(), "TE000001", map[string]interface{}{
+		"description":               "unknown-probe",
+		`description"=(SELECT 1)--`: "x",
+	})
+	assert.Error(t, err)
+
+	after, err := db.GetEegById(context.Background(), "TE000001")
+	require.NoError(t, err)
+	assert.Equal(t, before.Description, after.Description, "nichts darf geschrieben sein")
+}
+
+// TestUpdateEegOnlineState: online wird ueber den eigenen Weg gesetzt (admin-backend
+// nach der Ponton-Registrierung), nicht ueber den generischen Update.
+func TestUpdateEegOnlineState(t *testing.T) {
+	db, err := GetDB(context.Background())
+	require.NoError(t, err)
+
+	for _, want := range []bool{true, false} {
+		require.NoError(t, db.UpdateEegOnlineState(context.Background(), "TE000001", want))
+		eeg, err := db.GetEegById(context.Background(), "TE000001")
+		require.NoError(t, err)
+		assert.Equal(t, want, eeg.Online)
+	}
+}
+
+// 261028-mm1: in a GEA the tenant holding the metering point wins, an assigned row before an archived one; with one
+// tenant per community id the result is that of GetEegByEcId.
+func TestGetEegByEcIdAndMeters(t *testing.T) {
+	ctx := context.Background()
+	db, err := GetDB(ctx)
+	require.NoError(t, err)
+
+	const ecId = "AT00300000000GC000043000000000001"
+	const meter = "AT0030000000000000000000000043001"
+	// archived with the „Archivieren“ action (flag 2) in the first tenant, moved (flag 0) in the third, assigned in the second
+	for tenant, flag := range map[string]int{"GC000043": 2, "GC000043-002": 1, "GC000043-003": 0} {
+		_, err = testDB.DbInstance.Exec(`INSERT INTO base.eeg
+			(tenant, name, description, "rcNumber", area, gridoperator_code, gridoperator_name, "communityId",
+			 street, "streetNumber", city, zip, email)
+			VALUES ($1, 'GEA-43', 'GEA-Test', 'GC000043', 'GEA', 'AT003000', 'Netz OÖ', $2,
+			 'Weg', '1', 'Linz', '4020', 'gea-43@example.org')`, tenant, ecId)
+		require.NoError(t, err)
+		_, err = testDB.DbInstance.Exec(`INSERT INTO base.meteringpoint (metering_point_id, participant_id, tenant, direction,
+			status, process_state, "modifiedAt", "modifiedBy", "registeredSince", flag)
+			VALUES ($1, 'ea1142dc-03da-15ee-b82b-5a985b4b033a', $2, 'CONSUMPTION', 'ACTIVE', 'ACTIVE', now(), 'test',
+			 '2026-10-01', $3)`, meter, tenant, flag)
+		require.NoError(t, err)
+	}
+
+	eeg, err := db.GetEegByEcIdAndMeters(ctx, ecId, []string{meter})
+	require.NoError(t, err)
+	assert.Equal(t, "GC000043-002", eeg.Id)
+
+	// revoked in the base tenant (row stays flag 1, INACTIVE) and registering again in the third: the live row wins
+	const moved = "AT0030000000000000000000000043002"
+	for tenant, status := range map[string]string{"GC000043": "INACTIVE", "GC000043-003": "INIT"} {
+		_, err = testDB.DbInstance.Exec(`INSERT INTO base.meteringpoint (metering_point_id, participant_id, tenant, direction,
+			status, process_state, "modifiedAt", "modifiedBy", "registeredSince", flag)
+			VALUES ($1, 'ea1142dc-03da-15ee-b82b-5a985b4b033a', $2, 'CONSUMPTION', $3, 'PENDING', now(), 'test',
+			 '2026-10-01', 1)`, moved, tenant, status)
+		require.NoError(t, err)
+	}
+	eeg, err = db.GetEegByEcIdAndMeters(ctx, ecId, []string{moved})
+	require.NoError(t, err)
+	assert.Equal(t, "GC000043-003", eeg.Id)
+
+	// no metering point held by a tenant: the base tenant (named like the RC number), every time
+	eeg, err = db.GetEegByEcIdAndMeters(ctx, ecId, []string{"AT0030000000000000000000000043999"})
+	require.NoError(t, err)
+	assert.Equal(t, "GC000043", eeg.Id)
+	eeg, err = db.GetBaseEegByEcId(ctx, ecId)
+	require.NoError(t, err)
+	assert.Equal(t, "GC000043", eeg.Id)
+
+	// one tenant per community id: unchanged, also for an unknown metering point
+	eeg, err = db.GetEegByEcIdAndMeters(ctx, "AT00300000000TC000001000000000001", []string{"AT0030000000000000000000000043999"})
+	require.NoError(t, err)
+	assert.Equal(t, "TE000001", eeg.Id)
+
+	_, err = db.GetEegByEcIdAndMeters(ctx, "AT00300000000XX000000000000000000", nil)
+	assert.Error(t, err)
+}
+
+// EcIdBelongsToRc and GetTenantsByRcNumber follow one rule: a tenant belongs to an RC number by its RC number or by
+// its name, case-insensitive (261105-mm5).
+func TestEcIdBelongsToRc(t *testing.T) {
+	ctx := context.Background()
+	db, err := GetTestDB(ctx, testDB)
+	require.NoError(t, err)
+	const ecId, otherEc = "AT00300000000TC000331000000000001", "AT00300000000TC000332000000000001"
+	t.Cleanup(func() {
+		_, err := testDB.DbInstance.Exec(`DELETE FROM base.eeg WHERE tenant IN ('TE000331', 'GC000333-002', 'TE000332')`)
+		require.NoError(t, err)
+	})
+	for _, e := range [][3]string{{"TE000331", "RC000331", ecId}, {"GC000333-002", "GC000333", ecId}, {"TE000332", "TE000332", otherEc}} {
+		_, err := testDB.DbInstance.Exec(`INSERT INTO base.eeg (tenant, name, description, "rcNumber", area,
+			gridoperator_code, gridoperator_name, "communityId", street, "streetNumber", city, zip, email)
+			VALUES ($1, 'RC-Test', 'RC-Test', $2, 'LOCAL', 'AT003000', 'Netz OÖ', $3, 'Weg', '1', 'Linz', '4020',
+			'rc-test@example.org') ON CONFLICT (tenant) DO NOTHING`, e[0], e[1], e[2])
+		require.NoError(t, err)
+	}
+	for _, c := range []struct {
+		rc   string
+		want bool
+	}{
+		{"rc000331", true},     // RC number, lower case
+		{"te000331", true},     // tenant name, as GetTenantsByRcNumber
+		{"GC000333", true},     // GEA tenant by its RC number
+		{"gc000333-002", true}, // GEA tenant by its name
+		{"TE000332", false},    // a tenant of another community id
+		{"RC000999", false},
+	} {
+		ok, err := db.EcIdBelongsToRc(ctx, ecId, c.rc)
+		require.NoError(t, err)
+		assert.Equal(t, c.want, ok, c.rc)
 	}
 }

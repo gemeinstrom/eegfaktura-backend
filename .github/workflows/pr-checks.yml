@@ -1,0 +1,147 @@
+# Tests on every pull request: the unit tests (no Docker, no Keycloak) and the full suite (every
+# package with the race detector; the DAO tests start PostgreSQL through Testcontainers, which
+# needs the Docker of the GitHub-hosted runner).
+#
+# A fresh checkout does not compile without codegen (the generated code is not tracked):
+# `make tools generate` runs protoc for proto/*.proto, then go-jsonschema for model/registration_model.go.
+# Versions fixed, each release older than 7 days (checked 2026-10-28): Go 1.26.10 (2026-10-19),
+# protoc 29.3 (2025-01-08); protoc-gen-go, protoc-gen-go-grpc and go-jsonschema at the versions in
+# go.mod. Actions pinned by commit SHA.
+# Every job keeps its output as an artifact for 30 days (test-results-<job>),
+# for the CI report collector (vfeeg-development/eegfaktura-dev).
+
+name: PR Checks
+
+on:
+  pull_request:
+    # a commit that only changes the CHANGELOG (release PR) runs no checks (platform#239); schedules still run
+    paths-ignore: ['CHANGELOG.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.26.10'
+  PROTOC_VERSION: '29.3'
+  PROTOC_SHA256: '3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a'
+  # The time zone of the service (Dockerfile: ENV TZ): dates are built in time.Local, and the
+  # database tests expect local midnight of that zone. GitHub's runners run in UTC.
+  TZ: 'Europe/Berlin'
+  # Packages whose tests need a service: PostgreSQL via Testcontainers (api, database, eda).
+  # They run in the full suite only.
+  INTEGRATION_PACKAGES: 'api database eda'
+  # go test -json is kept as the result file; the console shows the test output read back from it
+  # (as with go test -v). Exit codes are go test's (pipefail).
+  GO_TEST_OUTPUT: '(fromjson? // {Action: "output", Output: (. + "\n")}) | select(.Action == "output" or .Action == "build-output") | .Output'
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Generate code
+        run: |
+          set -euo pipefail
+          curl -fsSLo "$RUNNER_TEMP/protoc.zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          echo "${PROTOC_SHA256}  $RUNNER_TEMP/protoc.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          gopath="$(go env GOPATH)"
+          export PATH="$RUNNER_TEMP/protoc/bin:$gopath/bin:$PATH"
+          # inside the module: the generator versions come from go.mod
+          make tools generate
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
+          if [ -n "$unformatted" ]; then
+            printf '::error file=%s::not gofmt-formatted\n' $unformatted
+            exit 1
+          fi
+
+      - name: Unit tests
+        run: |
+          set -euo pipefail
+          module="$(go list -m)"
+          read -ra integration <<< "$INTEGRATION_PACKAGES"
+          exclude="$(printf "^${module}/%s\$\n" "${integration[@]}" | paste -sd'|')"
+          mapfile -t pkgs < <(go list ./... | grep -vE "$exclude")
+          printf 'Package: %s\n' "${pkgs[@]}"
+          mkdir -p "$RUNNER_TEMP/results"
+          go test -json -count=1 "${pkgs[@]}" \
+            | tee "$RUNNER_TEMP/results/unit.json" | jq -Rrj --unbuffered "$GO_TEST_OUTPUT"
+
+      - name: Keep the test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results-unit
+          path: ${{ runner.temp }}/results
+          if-no-files-found: ignore
+          retention-days: 30
+
+  full:
+    name: Full test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Generate code
+        run: |
+          set -euo pipefail
+          curl -fsSLo "$RUNNER_TEMP/protoc.zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          echo "${PROTOC_SHA256}  $RUNNER_TEMP/protoc.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          gopath="$(go env GOPATH)"
+          export PATH="$RUNNER_TEMP/protoc/bin:$gopath/bin:$PATH"
+          # inside the module: the generator versions come from go.mod
+          make tools generate
+
+      - name: Check Docker (Testcontainers)
+        run: docker version --format 'Docker {{.Server.Version}}'
+
+      - name: Full test suite
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/results"
+          go test -json -race -count=1 ./... \
+            | tee "$RUNNER_TEMP/results/full.json" | jq -Rrj --unbuffered "$GO_TEST_OUTPUT"
+
+      - name: Keep the test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results-full
+          path: ${{ runner.temp }}/results
+          if-no-files-found: ignore
+          retention-days: 30

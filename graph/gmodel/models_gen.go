@@ -3,7 +3,8 @@
 package gmodel
 
 type EegModel struct {
-	Tenant             *string `json:"tenant,omitempty"`
+	Tenant *string `json:"tenant,omitempty"`
+	// Ignored: the settlement interval changes only through POST /eeg/settlementinterval with its rule.
 	SettlementInterval *string `json:"settlementInterval,omitempty"`
 	SepaActiv          *bool   `json:"sepaActiv,omitempty"`
 }

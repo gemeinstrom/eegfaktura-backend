@@ -130,7 +130,6 @@ func Test_confirmParticipantOnline(t *testing.T) {
 				State:            nil,
 				PartFact:         10,
 				ActivationMode:   model.ONLINE,
-				ActivationCode:   "",
 			},
 		}
 		b, err := json.Marshal(meters)
@@ -199,23 +198,32 @@ func Test_confirmParticipantOnline(t *testing.T) {
 			},
 		},
 	}
+	db, err := database.GetDB(context.Background())
+	require.NoError(t, err)
+	h := NewParticipantHandler(db)
+	orig := mqttclient.RegistrationForParticipation
+	t.Cleanup(func() { mqttclient.RegistrationForParticipation = orig })
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req, _ := http.NewRequest("POST", "/participant/ea9942db-03da-11ee-b82b-5a985b4b033a/confirm", strings.NewReader(tt.args.request))
 			w := httptest.NewRecorder()
-			mqttclient.RegistrationForParticipation = tt.args.mqttReqFunc
+			calls := 0
+			mqttclient.RegistrationForParticipation = func(eeg *model.Eeg, meter *model.MeteringPoint, from *int64) error {
+				calls++
+				return tt.args.mqttReqFunc(eeg, meter, from)
+			}
 			req = mux.SetURLVars(req, map[string]string{
 				"id": "ea9942db-03da-11ee-b82b-5a985b4b033a",
 			})
 
-			confirmParticipant()(w, req, claims, tt.args.tenant)
+			h.confirmParticipant()(w, req, claims, tt.args.tenant)
 
-			db, err := database.GetDB(context.Background())
-			require.NoError(t, err)
-
-			pUnderTest, err := db.QueryParticipant("ea9942db-03da-11ee-b82b-5a985b4b033a")
+			pUnderTest, err := db.QueryParticipant(context.Background(), tt.args.tenant, "ea9942db-03da-11ee-b82b-5a985b4b033a")
 			require.NoError(t, err)
 			tt.check(t, w, pUnderTest)
+			// one ONLINE metering point in the request -> one registration via MQTT
+			assert.Equal(t, 1, calls, "registrations sent via MQTT")
 		})
 	}
 }

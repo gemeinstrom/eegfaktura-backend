@@ -42,6 +42,8 @@ message RegisterEegRequest {
     LOCAL = 1;
     BEG = 2;
     GEA = 3;
+    P2P = 4;
+    EVA = 5;
   }
 
   enum GRID_ALLOCATION {

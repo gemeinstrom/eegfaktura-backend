@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -29,16 +31,19 @@ func InitEegRouter(r *mux.Router, db database.Database) *mux.Router {
 
 	s.HandleFunc("", middleware.ConditionProtect(h.getEEG(), h.getEEG())).Methods("GET")
 	s.HandleFunc("", middleware.Protect(h.updateEEG())).Methods("POST")
+	s.HandleFunc("/settlementinterval", middleware.Protect(h.changeSettlementInterval())).Methods("POST")
 	s.HandleFunc("/tariff", middleware.Protect(h.getTariff())).Methods("GET")
 	s.HandleFunc("/tariff", middleware.Protect(h.addTariff())).Methods("POST")
 	s.HandleFunc("/tariff/{id}", middleware.Protect(h.fetchTariffHistory())).Methods("GET")
 	s.HandleFunc("/tariff/{id}", middleware.Protect(h.archiveTariff())).Methods("DELETE")
 	s.HandleFunc("/sync/participants/{oid}", middleware.Protect(h.syncParticipantsEda())).Methods("POST")
 	s.HandleFunc("/import/masterdata", middleware.Protect(h.uploadMasterData())).Methods("POST")
-	s.HandleFunc("/export/masterdata", middleware.Protect(h.exportMasterData())).Methods("GET")
+	// POST carries the optional joiningFeeState list from billing (konzept-beitrittsgebuehr.md); GET stays for older web
+	s.HandleFunc("/export/masterdata", middleware.Protect(h.exportMasterData())).Methods("GET", "POST")
 	s.HandleFunc("/notifications/{id}", middleware.Protect(h.notifications())).Methods("GET")
 	s.HandleFunc("/gridoperators", middleware.Protect(h.gridOperators())).Methods("GET")
 	s.HandleFunc("/user/get-user", middleware.Protect(h.getUser())).Methods("GET")
+	initMailTemplateRoutes(s, db)
 
 	//_ = InitUserRouter(s)
 
@@ -47,7 +52,7 @@ func InitEegRouter(r *mux.Router, db database.Database) *mux.Router {
 
 func (h *EegHandler) getEEG() middleware.JWTHandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request, claims *middleware.PlatformClaims, tenant string) {
-		log.Infof("Query EEG with TENANT: %s", tenant)
+		log.WithContext(r.Context()).Info("Query EEG")
 
 		var eeg *model.Eeg
 		var err error
@@ -58,7 +63,7 @@ func (h *EegHandler) getEEG() middleware.JWTHandlerFunc {
 		}
 
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
 			return
 		}
 
@@ -66,7 +71,7 @@ func (h *EegHandler) getEEG() middleware.JWTHandlerFunc {
 			respondWithHttpError(w, http.StatusBadRequest, BadProcessError(1001, fmt.Sprintf("EEG %s is not existing yet!", tenant)))
 			return
 		}
-		respondWithData(w, http.StatusOK, eeg)
+		respondWithJSON(w, http.StatusOK, eeg)
 	}
 }
 
@@ -75,31 +80,31 @@ func (h *EegHandler) updateEEG() middleware.JWTHandlerFunc {
 		var e map[string]interface{}
 		err := json.NewDecoder(r.Body).Decode(&e)
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, model.ErrParseJson(err))
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrParseJson(err))
 			return
 		}
 
 		if err = h.db.UpdateEegPartial(r.Context(), tenant, e); err != nil {
-			respondWithHttpError(w, http.StatusBadRequest, BadProcessError(1002, err.Error()))
+			respondWithHttpError(w, http.StatusBadRequest, BadProcessError(1002, model.UserText(err)))
 			return
 		}
 		eeg, err := h.db.GetEegById(r.Context(), tenant)
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
 			return
 		}
-		respondWithData(w, http.StatusOK, eeg)
+		respondWithJSON(w, http.StatusOK, eeg)
 	}
 }
 
 func (h *EegHandler) getTariff() middleware.JWTHandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request, claims *middleware.PlatformClaims, tenant string) {
-		tariff, err := h.db.GetTariff(tenant)
+		tariff, err := h.db.GetTariff(r.Context(), tenant)
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, err)
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, err)
 			return
 		}
-		respondWithData(w, http.StatusOK, tariff)
+		respondWithJSON(w, http.StatusOK, tariff)
 	}
 }
 
@@ -110,16 +115,26 @@ func (h *EegHandler) addTariff() middleware.JWTHandlerFunc {
 		var t model.Tariff
 		err := json.NewDecoder(r.Body).Decode(&t)
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, model.ErrParseJson(err))
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrParseJson(err))
 			return
 		}
-		log.Printf("ADD TARIF: %+v Tenant: %+v", t, tenant)
+		log.WithContext(r.Context()).Printf("ADD TARIF: %s (%s)", t.Name, t.Id)
 
-		if err = h.db.AddTariff(tenant, claims.Username, &t); err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, err)
+		// ZVT: serverseitige Plausibilitaetspruefung der Zeitfenster
+		if err = t.ValidateTimeTariff(); err != nil {
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrUpdateTariff(err))
 			return
 		}
-		respondWithData(w, http.StatusCreated, t)
+		if err = t.ValidateJoiningFee(); err != nil {
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrUpdateTariff(err))
+			return
+		}
+
+		if err = h.db.AddTariff(r.Context(), tenant, claims.Username, &t); err != nil {
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, err)
+			return
+		}
+		respondWithJSON(w, http.StatusCreated, t)
 	}
 }
 
@@ -130,11 +145,11 @@ func (h *EegHandler) fetchTariffHistory() middleware.JWTHandlerFunc {
 
 		var data []model.Tariff
 		var err error
-		if data, err = h.db.GetTariffHistory(tenant, idStr); err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, err)
+		if data, err = h.db.GetTariffHistory(r.Context(), tenant, idStr); err != nil {
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, err)
 			return
 		}
-		respondWithData(w, http.StatusOK, data)
+		respondWithJSON(w, http.StatusOK, data)
 	}
 }
 
@@ -144,10 +159,10 @@ func (h *EegHandler) archiveTariff() middleware.JWTHandlerFunc {
 		idStr := vars["id"]
 
 		if err := h.db.ArchiveTariff(tenant, idStr); err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, err)
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, err)
 			return
 		}
-		respondWithData(w, http.StatusAccepted, map[string]interface{}{"status": "ok"})
+		respondWithJSON(w, http.StatusAccepted, map[string]interface{}{"status": "ok"})
 	}
 }
 
@@ -158,7 +173,7 @@ func (h *EegHandler) syncParticipantsEda() middleware.JWTHandlerFunc {
 
 		eeg, err := h.db.GetEegById(r.Context(), tenant)
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
 			return
 		}
 
@@ -166,8 +181,16 @@ func (h *EegHandler) syncParticipantsEda() middleware.JWTHandlerFunc {
 		from := time.Date(day.Year(), day.Month(), day.Day()-1, 0, 0, 0, 0, day.Location()).UnixMilli()
 		to := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, day.Location()).UnixMilli()
 
-		if err = mqttclient.RequestingMeteringPointList(eeg, operatorId, from, to); err != nil {
-			respondWith(w, http.StatusInternalServerError, tenant, err)
+		var operators []string
+		if model.HasMultipleGridOperators(eeg.Area) {
+			if operators, err = h.db.MeteringPointGridOperators(r.Context(), tenant); err != nil {
+				respondWith(r.Context(), w, http.StatusInternalServerError, tenant, model.ErrFindMeter(err))
+				return
+			}
+		}
+		// an error means the receiver is missing or not one of the community: nothing sent (eegfaktura-dev#56 #7)
+		if err = mqttclient.RequestingMeteringPointList(eeg, operatorId, operators, from, to); err != nil {
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, err)
 			return
 		}
 		respondWithStatus(w, http.StatusNoContent)
@@ -188,48 +211,78 @@ func (h *EegHandler) uploadMasterData() middleware.JWTHandlerFunc {
 
 		file, handler, err := r.FormFile("masterdatafile")
 		if err != nil {
-			log.WithField("tenant", tenant).Error(err)
+			log.WithContext(r.Context()).WithField("tenant", tenant).Error(err)
 			respondWithHttpError(w, http.StatusBadRequest, BadProcessError(1051, err.Error()))
 			return
 		}
 		defer func() { _ = file.Close() }()
 
-		log.Infof("--- Upload File: %s, %s, %s\n", sheet, handler.Filename, tenant)
+		log.WithContext(r.Context()).Infof("--- Upload File: sheet %s\n", sheet)
 
 		if err = h.db.ImportMasterdataFromExcel(r.Context(), file, handler.Filename, sheet, tenant); err != nil {
-			log.WithField("tenant", tenant).Error(err)
+			// a wrong sheet name: the German text for the user instead of "Bad Process"
+			var ve *model.VfeegError
+			if errors.As(err, &ve) && ve.Code == model.ErrImportSheetMissing(nil).Code {
+				respondWith(r.Context(), w, http.StatusBadRequest, tenant, ve)
+				return
+			}
+			log.WithContext(r.Context()).WithField("tenant", tenant).Error(err)
 			respondWithHttpError(w, http.StatusBadRequest, BadProcessError(1052, err.Error()))
 		} else {
-			log.Infof("Import File %s successful", handler.Filename)
+			log.WithContext(r.Context()).Info("Import File successful")
 			respondWithStatus(w, http.StatusNoContent)
 		}
 	}
 }
 
+// maxJoiningFeeStateBytes bounds the list web posts with the member export (about 200 bytes per member).
+const maxJoiningFeeStateBytes = 8 << 20
+
 func (h *EegHandler) exportMasterData() middleware.JWTHandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request, claims *middleware.PlatformClaims, tenant string) {
+		// optional body: billing's joiningFeeState list, passed on by web; no body = status column stays empty
+		var feeStates []model.JoiningFeeState
+		if r.Method == http.MethodPost {
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJoiningFeeStateBytes)).Decode(&feeStates); err != nil && !errors.Is(err, io.EOF) {
+				respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrParseJson(err))
+				return
+			}
+		}
+
 		eeg, err := h.db.GetEegById(r.Context(), tenant)
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
 			return
 		}
 
 		participants, err := h.db.GetParticipants(r.Context(), tenant)
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, err)
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, err)
 			return
 		}
 
-		tariffMap, err := h.db.GetTariffNameMap(tenant)
+		tariffMap, err := h.db.GetTariffNameMap(r.Context(), tenant)
 		if err != nil {
 			respondWithHttpError(w, http.StatusBadRequest, BadProcessError(1059, err.Error()))
 			return
 		}
 
-		b, err := database.ExportMasterdataToExcel(participants, eeg, tariffMap)
+		tariffs, err := h.db.GetTariff(r.Context(), tenant)
+		if err != nil {
+			respondWithHttpError(w, http.StatusBadRequest, BadProcessError(1059, err.Error()))
+			return
+		}
+		joiningFees := map[string]float64{}
+		for _, t := range tariffs {
+			if t.Type == model.EEG && t.JoiningFee > 0 {
+				joiningFees[t.Id.String()] = t.JoiningFee
+			}
+		}
+
+		b, err := database.ExportMasterdataToExcel(r.Context(), participants, eeg, tariffMap, joiningFees, feeStates)
 
 		if err != nil {
-			log.Errorf("Create Energy Export: %v", err.Error())
+			log.WithContext(r.Context()).Errorf("Create Energy Export: %v", err.Error())
 			respondWithHttpError(w, http.StatusInternalServerError, BadProcessError(1051, err.Error()))
 			return
 		}
@@ -268,12 +321,12 @@ func (h *EegHandler) notifications() middleware.JWTHandlerFunc {
 			return false
 		}
 
-		notifications, err := h.db.GetNotification(tenant, id, isAdmin())
+		notifications, err := h.db.GetNotification(r.Context(), tenant, id, isAdmin())
 		if err != nil {
 			respondWithHttpError(w, http.StatusBadRequest, BadProcessError(1055, err.Error()))
 			return
 		}
-		respondWithData(w, http.StatusOK, notifications)
+		respondWithJSON(w, http.StatusOK, notifications)
 	}
 }
 
@@ -284,7 +337,7 @@ func (h *EegHandler) gridOperators() middleware.JWTHandlerFunc {
 			respondWithHttpError(w, http.StatusBadRequest, BadProcessError(1055, err.Error()))
 			return
 		}
-		respondWithData(w, http.StatusOK, o)
+		respondWithJSON(w, http.StatusOK, o)
 	}
 }
 
@@ -298,9 +351,9 @@ func (h *EegHandler) getUser() middleware.JWTHandlerFunc {
 
 		tn, err := h.db.FetchTenantsName(r.Context(), tenants, su)
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, model.ErrGetUser(err))
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrGetUser(err))
 			return
 		}
-		respondWithData(w, http.StatusOK, tn)
+		respondWithJSON(w, http.StatusOK, tn)
 	}
 }

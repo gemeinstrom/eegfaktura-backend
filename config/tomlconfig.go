@@ -9,8 +9,8 @@ import (
 )
 
 // ReadActivationMailTemplateConfig reads the mail template descriptor named
-// name from fsys — a per-tenant or global templates dir on the data volume, or
-// the templates embedded in the binary.
+// name from fsys — the templates embedded in the binary, or a volume copy read
+// by cmd/mailtemplate-import.
 func ReadActivationMailTemplateConfig(fsys fs.FS, name string) (*model.ActivationMailTemplate, error) {
 	data, err := fs.ReadFile(fsys, name)
 	if err != nil {

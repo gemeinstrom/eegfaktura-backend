@@ -31,37 +31,6 @@ func trimString(s string) string {
 	return s
 }
 
-func TestGetTemplateFor(t *testing.T) {
-	type args struct {
-		templateType string
-		tenant       string
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    string
-		wantErr bool
-	}{
-		{"Hugo",
-			args{"ACTIVATION", "RC100181"},
-			filepath.Join("../public", "RC100181", "templates", "AktivierungsEmail-templates.html"),
-			false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := GetTemplateFor(tt.args.templateType, tt.args.tenant)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("GetTemplateFor() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got != tt.want {
-				t.Errorf("GetTemplateFor() got = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestParseTemplate(t *testing.T) {
 
 	eeg := &model.Eeg{
@@ -136,7 +105,7 @@ func TestParseTemplate(t *testing.T) {
 				Meteringpoints []string
 			}{eeg, participant, []string{"AT0010000000000000000000000111"}}},
 			bytes.NewBufferString(strings.Trim(`<!DOCTYPE html>
-        <html lang="en">
+        <html lang="de">
         <head>
             <meta charset="UTF-8">
             <title>Aktivierung Zählpunkt</title>
@@ -162,8 +131,6 @@ func TestParseTemplate(t *testing.T) {
         
         </p>
         
-        <p>versandt durch</p>
-        <img src="cid:eegfaktura-logo-1" style="max-height: 90px"/>
         </body>
         </html>`, " ")),
 			false,
@@ -400,7 +367,7 @@ func TestParseTemplate2(t *testing.T) {
 		return nil
 	}
 
-	err := SendActivationMailFromTemplate(sendMock, "sepp", "test", eeg, participant, "activation-mail-template.toml")
+	err := SendActivationMailFromTemplate(sendMock, nil, "sepp", "test", eeg, participant, "activation-mail-template.toml")
 	assert.NoError(t, err)
 }
 
@@ -477,7 +444,6 @@ func TestManualSending(t *testing.T) {
 				State:            nil,
 				PartFact:         0,
 				ActivationMode:   "",
-				ActivationCode:   "",
 				AllocationFactor: null.Float{},
 			}},
 			TariffId: null.String{},
@@ -494,7 +460,7 @@ func TestManualSending(t *testing.T) {
 	}
 
 	var err error
-	if err = SendActivationMailFromTemplate(services.SendMail,
+	if err = SendActivationMailFromTemplate(services.SendMail, nil,
 		eeg.Id, "Aktivierung im Serviceportal", eeg, participant, "activation-mail-template.toml"); err != nil {
 		logrus.WithField("tenant", eeg.Id).WithError(err).Error("Error Sending Mail")
 	}

@@ -7,9 +7,6 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"time"
-
-	"github.com/golang-jwt/jwt"
 )
 
 var (
@@ -29,13 +26,6 @@ type contextKey struct {
 }
 
 var tenantCtxKey = &contextKey{"tenant"}
-var superUserCtxKey = &contextKey{"superuser"}
-
-func init() {
-	jwt.TimeFunc = func() time.Time {
-		return time.Now().UTC().Add(time.Second * 5)
-	}
-}
 
 // ParseBearerTokenFromHeader extracts the Bearer token from the Authorization header.
 // Returns a non-empty token or an error describing the problem.

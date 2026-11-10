@@ -1,10 +1,38 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 )
+
+// ErrInvalidEmail is what an invalid address list reads as in a log.
+var ErrInvalidEmail = errors.New("invalid email")
+
+// AddressError is an error whose details name e-mail addresses. Error() leaves them out, so whatever
+// logs the error writes no address; UserText gives the details for the person who corrects them
+// (API answer, admin notification).
+type AddressError struct {
+	Safe   error // the text for logs; errors.Is matches it
+	Detail string
+}
+
+func (e *AddressError) Error() string { return e.Safe.Error() }
+func (e *AddressError) Unwrap() error { return e.Safe }
+
+// UserText is the text of err for a person: with the addresses of an AddressError, else err.Error().
+func UserText(err error) string {
+	var v *VfeegError
+	if errors.As(err, &v) {
+		err = v.Err
+	}
+	var a *AddressError
+	if errors.As(err, &a) {
+		return a.Detail
+	}
+	return err.Error()
+}
 
 // emailPartRe is the shared address rule used across the eegfaktura
 // suite (backend, eda-xp, billing, web): after trimming, exactly one
@@ -34,7 +62,8 @@ func NormalizeEmailList(email string) string {
 // part against the shared rule. An empty result (no address at all) is
 // valid — a member without an e-mail is not an error. On success the
 // normalized list is returned; on failure the offending part is named
-// so tenant admins can correct the member data.
+// so tenant admins can correct the member data (an AddressError: the
+// name stays out of the logs).
 func ValidateEmailList(email string) (string, error) {
 	normalized := NormalizeEmailList(email)
 	if normalized == "" {
@@ -42,7 +71,7 @@ func ValidateEmailList(email string) (string, error) {
 	}
 	for _, p := range strings.Split(normalized, ";") {
 		if !emailPartRe.MatchString(p) {
-			return "", fmt.Errorf("invalid email (%s)", p)
+			return "", &AddressError{Safe: ErrInvalidEmail, Detail: fmt.Sprintf("Die E-Mail-Adresse „%s“ ist ungültig.", p)}
 		}
 	}
 	return normalized, nil

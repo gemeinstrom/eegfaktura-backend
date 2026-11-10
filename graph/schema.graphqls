@@ -12,7 +12,8 @@ type Link {
 
 input EegModel {
   tenant: String
-  settlementInterval: String
+  "Ignored: the settlement interval changes only through POST /eeg/settlementinterval with its rule."
+  settlementInterval: String @deprecated(reason: "Ignored, changes nothing: use POST /eeg/settlementinterval.")
   sepaActiv: Boolean
 }
 

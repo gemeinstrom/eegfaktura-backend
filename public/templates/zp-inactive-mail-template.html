@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Zählpunkt nicht mehr Teil der Energiegemeinschaft</title>
+</head>
+<body>
+<p>Hallo {{.Participant.FirstName}},</p>
+<p>dein Zählpunkt <strong>{{.MeteringPoint}}</strong>{{if .Direction}} ({{.Direction}}){{end}} ist {{if .EndDate}}ab dem <strong>{{.EndDate}}</strong> {{end}}nicht mehr Teil der Energiegemeinschaft {{if .Eeg.Description}}{{.Eeg.Description}}{{else}}{{.Eeg.Name}}{{end}}.</p>
+<p>{{.Reason}}</p>
+<p>Falls das nicht beabsichtigt war oder du Fragen hast, melde dich bitte bei deiner Energiegemeinschaft.</p>
+<p>Mit besten Grüßen</p>
+<div>{{.Eeg.Description}}</div>
+<div>{{.Eeg.Zip}} {{.Eeg.City}}, {{.Eeg.Street}} {{.Eeg.StreetNumber}}</div>
+{{if .Eeg.Contact.Phone.Valid}}
+<div>T: {{.Eeg.Contact.Phone.String}}</div>
+{{end}}
+{{if .Eeg.Contact.Email.Valid}}
+<div>E: {{.Eeg.Contact.Email.String}}</div>
+{{end}}
+{{if .Eeg.Website.Valid}}
+<div>{{.Eeg.Website.String}}</div>
+{{end}}
+</body>
+</html>

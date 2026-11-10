@@ -34,6 +34,13 @@ var (
 		94: "Keine Daten im angeforderten Zeitraum vorhanden",
 	}
 	REJECTED_INVALID_CODES = []int16{56, 184, 177, 159, 158, 156, 86}
+	// REJECTED_KEEP_ACTIVE_CODES: rejection codes that concern the request, not the metering point
+	// itself — 172/173 consent refused / not answered, 183 sum of allocation keys > 100 %, 188
+	// participation factor > 100 %. Such a rejection leaves an ACTIVE metering point ACTIVE
+	// (REVOKED and other non-registration states stay); other codes (56 not found, 57 not supplied, 185 not in the community area, …) set
+	// INVALID/REJECTED as before,
+	// so the admin sees the inconsistency (konzept-zaehlpunkt-ausblenden.md, part 2, decision 24.10.2026).
+	REJECTED_KEEP_ACTIVE_CODES = []int16{172, 173, 183, 188}
 )
 
 type EbMsMessageType string
@@ -123,6 +130,8 @@ type Meter struct {
 	PlantCategory string        `json:"plantCategory,omitempty"`
 	Share         float64       `json:"share,omitempty"`
 	ConsentID     string        `json:"consentId,omitempty"`
+	TechCode      string        `json:"techCode,omitempty"` // inbound ECMPList: TechCode of the metering point (platform#229)
+	FuelCode      string        `json:"fuelCode,omitempty"` // inbound ECMPList: FuelCode of the metering point (platform#229)
 }
 
 type ResponseData struct {
@@ -159,6 +168,8 @@ type EbmsMessage struct {
 	ErrorMessage       string             `json:"errorMessage,omitempty"`
 	ConsentEnd         int64              `json:"consentEnd,omitempty"`
 	Reason             string             `json:"reason,omitempty"`
+	EcZoneLevel        *int               `json:"ecZoneLevel,omitempty"` // inbound ECMPList: Nahebereich 1–7 (platform#229)
+	EcTypeEda          string             `json:"ecTypeEda,omitempty"`   // inbound ECMPList: ECType as received, e.g. "PP"
 }
 
 func (ebms EbmsMessage) Meters() []string {

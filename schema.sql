@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS base.EEG
     description          VARCHAR(100),
     periods              JSON             DEFAULT ('[]'),
     "rcNumber"           TEXT    NOT NULL,
-    area                 TEXT    NOT NULL, /* Ortsgebiet (LOCAL | REGIONAL) | BEG | GEA */
+    area                 TEXT    NOT NULL, /* Ortsgebiet (LOCAL | REGIONAL) | BEG | GEA | P2P | EVA */
     legal                TEXT    NOT NULL DEFAULT 'verein', /* Unternehmensform ("verein" | "genossenschaft" | "gesellschaft") */
     gridoperator_code    TEXT    NOT NULL,
     gridoperator_name    TEXT    NOT NULL,
@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS base.EEG
     phone                TEXT,
     email                TEXT    NOT NULL,
     website              TEXT,
+    ec_zone_level        SMALLINT CHECK (ec_zone_level BETWEEN 1 AND 7), /* Nahebereich, empty = unknown */
 
     online               BOOLEAN NOT NULL DEFAULT false
 );
@@ -71,6 +72,20 @@ CREATE TABLE IF NOT EXISTS "base"."tariff"
     "meteringPointFee"     double precision,
     "meteringPointVat"     integer,
     "useMeteringPointFee"  boolean          DEFAULT false                     NOT NULL,
+    "useTimeTariff"         boolean         DEFAULT false                     NOT NULL,
+    "timeTariff1Active"     boolean         DEFAULT false                     NOT NULL,
+    "timeTariff1Name"       varchar,
+    "timeTariff1From"       time,
+    "timeTariff1To"         time,
+    "timeTariff1CentPerKWh" double precision,
+    "timeTariff2Active"     boolean         DEFAULT false                     NOT NULL,
+    "timeTariff2Name"       varchar,
+    "timeTariff2From"       time,
+    "timeTariff2To"         time,
+    "timeTariff2CentPerKWh" double precision,
+    "joiningFee"             numeric(10, 2)  DEFAULT 0                         NOT NULL,
+    "joiningFeeUseVat"       boolean         DEFAULT false                     NOT NULL,
+    "joiningFeeVatInPercent" numeric         DEFAULT 0                         NOT NULL,
     CONSTRAINT tariffpk PRIMARY KEY (id, version)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tariff ON base.tariff (id, tenant, name, type, version);
@@ -168,6 +183,8 @@ CREATE TABLE IF NOT EXISTS base.meteringpoint
     inactiveSince      DATE,
     active             INT       NOT NULL DEFAULT 1,
     flag               INT       NOT NULL DEFAULT 1,
+    tech_code          TEXT, /* TechCode of the grid operator's metering point list */
+    fuel_code          TEXT, /* FuelCode of the grid operator's metering point list */
     CONSTRAINT meteringpointPK PRIMARY KEY (metering_point_id, tenant, participant_id),
     CONSTRAINT FK_ParticipantMeteringpoint FOREIGN KEY (participant_id) REFERENCES base.participant (id) ON DELETE CASCADE
 --    UNIQUE (metering_point_id, active)
@@ -188,6 +205,7 @@ CREATE TABLE IF NOT EXISTS base.metering_partition_factor
     CONSTRAINT FK_MeteringpointPartition FOREIGN KEY (metering_point_id, tenant, participant_id)
         REFERENCES base.meteringpoint (metering_point_id, tenant, participant_id) ON DELETE CASCADE ON UPDATE CASCADE
 );
+CREATE INDEX IF NOT EXISTS metering_partition_factor_tenant_idx ON base.metering_partition_factor (tenant);
 
 CREATE TABLE IF NOT EXISTS base.notification
 (
@@ -199,6 +217,9 @@ CREATE TABLE IF NOT EXISTS base.notification
     date         TIMESTAMP NOT NULL DEFAULT (now()),
     role         VARCHAR   NOT NULL DEFAULT 'ADMIN' /* 'USER' | 'ADMIN' */
 );
+CREATE INDEX IF NOT EXISTS notification_energy_request_idx ON base.notification (tenant, id) WHERE process = 'ENERGY_REQUEST';
+CREATE INDEX IF NOT EXISTS notification_summary_idx ON base.notification (tenant, id)
+    WHERE (notification->>'type') = 'ZUSAMMENFASSUNG_PT';
 
 CREATE TABLE IF NOT EXISTS base.processhistory
 (
@@ -220,6 +241,49 @@ CREATE TABLE IF NOT EXISTS base.gridoperators
     CONSTRAINT PK_GridOperators PRIMARY KEY (id, name)
 );
 
+CREATE TABLE IF NOT EXISTS base.mail_template
+(
+    tenant                   TEXT        NOT NULL,
+    mail_key                 TEXT        NOT NULL, /* consent-request | zp-active | zp-inactive */
+    subject                  TEXT        NOT NULL,
+    body_html                TEXT        NOT NULL, /* sanitised HTML, placeholders as span/div data-ph */
+    version                  INTEGER     NOT NULL DEFAULT 1,
+    default_version          INTEGER     NOT NULL, /* catalog default the version is based on */
+    notified_default_version INTEGER     NOT NULL DEFAULT 0,
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by               TEXT        NOT NULL,
+    attachment_file_id       UUID, /* the PDF of this version, NULL = none */
+    CONSTRAINT mail_template_pk PRIMARY KEY (tenant, mail_key)
+);
+
+CREATE TABLE IF NOT EXISTS base.mail_template_file
+(
+    id         UUID        NOT NULL PRIMARY KEY,
+    tenant     TEXT        NOT NULL,
+    mail_key   TEXT        NOT NULL,
+    kind       TEXT        NOT NULL CHECK (kind IN ('image', 'attachment')),
+    filename   TEXT        NOT NULL,
+    mime_type  TEXT        NOT NULL,
+    size       BIGINT      NOT NULL,
+    content    BYTEA       NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    committed  BOOLEAN     NOT NULL DEFAULT false /* false = draft upload, never sent */
+);
+CREATE INDEX IF NOT EXISTS idx_mail_template_file_tenant_key ON base.mail_template_file (tenant, mail_key);
+
+CREATE TABLE IF NOT EXISTS base.settlement_interval_change
+(
+    id                BIGSERIAL PRIMARY KEY,
+    tenant            TEXT        NOT NULL,
+    old_value         TEXT        NOT NULL,
+    new_value         TEXT        NOT NULL,
+    effective_from    DATE, /* NULL = applies at once (no final settlement yet) */
+    last_final_period TEXT, /* last final clearing period of the billing state passed on by web */
+    changed_by        TEXT        NOT NULL,
+    changed_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_interval_change_tenant ON base.settlement_interval_change (tenant);
+
 CREATE OR REPLACE VIEW base.activeMeteringPartition AS
 SELECT partp.metering_point_id,
        partp.version,
@@ -237,7 +301,7 @@ FROM (SELECT metering_partition_factor.metering_point_id,
              metering_partition_factor."createdAt",
              metering_partition_factor."createdBy",
              row_number()
-             OVER (PARTITION BY metering_partition_factor.metering_point_id, metering_partition_factor.participant_id ORDER BY metering_partition_factor.version DESC) AS rowid
+             OVER (PARTITION BY metering_partition_factor.tenant, metering_partition_factor.metering_point_id, metering_partition_factor.participant_id ORDER BY metering_partition_factor.version DESC) AS rowid
       FROM base.metering_partition_factor) partp
 WHERE partp.rowid = 1;
 
@@ -261,7 +325,21 @@ SELECT id,
        "freeKWh",
        "meteringPointFee",
        "meteringPointVat",
-       "useMeteringPointFee"
+       "useMeteringPointFee",
+       "useTimeTariff",
+       "timeTariff1Active",
+       "timeTariff1Name",
+       to_char("timeTariff1From", 'HH24:MI') AS "timeTariff1From",
+       to_char("timeTariff1To", 'HH24:MI')   AS "timeTariff1To",
+       "timeTariff1CentPerKWh",
+       "timeTariff2Active",
+       "timeTariff2Name",
+       to_char("timeTariff2From", 'HH24:MI') AS "timeTariff2From",
+       to_char("timeTariff2To", 'HH24:MI')   AS "timeTariff2To",
+       "timeTariff2CentPerKWh",
+       "joiningFee",
+       "joiningFeeUseVat",
+       "joiningFeeVatInPercent"
 FROM base.tariff,
      (SELECT id as tid, MAX(version) as tversion FROM base.tariff GROUP BY id) as x
 WHERE id = x.tid
@@ -327,6 +405,17 @@ SELECT p.id                                                    AS participant_id
        t."centPerKWh"                                          AS tariff_working_fee_per_consumedkwh,
        t."centPerKWh"                                          AS tariff_credit_amount_per_producedkwh,
        t."freeKWh"                                             AS tariff_freekwh,
+       t."useTimeTariff"                                       AS tariff_use_time_tariff,
+       t."timeTariff1Active"                                   AS tariff_time1_active,
+       t."timeTariff1Name"                                     AS tariff_time1_name,
+       t."timeTariff1From"                                     AS tariff_time1_from,
+       t."timeTariff1To"                                       AS tariff_time1_to,
+       t."timeTariff1CentPerKWh"                               AS tariff_time1_cent_per_kwh,
+       t."timeTariff2Active"                                   AS tariff_time2_active,
+       t."timeTariff2Name"                                     AS tariff_time2_name,
+       t."timeTariff2From"                                     AS tariff_time2_from,
+       t."timeTariff2To"                                       AS tariff_time2_to,
+       t."timeTariff2CentPerKWh"                               AS tariff_time2_cent_per_kwh,
        t.version                                               AS tariff_version,
        t.id                                                    AS tariff_id,
        COALESCE(b."bankName", ''::text)                        AS participant_bank_name,
@@ -336,7 +425,11 @@ SELECT p.id                                                    AS participant_id
        COALESCE(c."bankName", ''::text)                        AS eec_bank_name,
        c.iban                                                  AS eec_bank_iban,
        c.owner                                                 AS eec_bank_owner,
-       c.creditor_id                                           AS eec_bank_creditor_id
+       c.creditor_id                                           AS eec_bank_creditor_id,
+       COALESCE(tp."joiningFee", 0::numeric)                   AS tariff_joining_fee,
+       COALESCE(tp."joiningFeeUseVat", false)                  AS tariff_joining_fee_use_vat,
+       COALESCE(tp."joiningFeeVatInPercent", 0::numeric)       AS tariff_joining_fee_vat_in_percent,
+       c.area                                                  AS eeg_area
 FROM base.participant p
          LEFT JOIN base.eeg c ON c.tenant::text = p.tenant::text
          LEFT JOIN base.meteringpoint pm ON pm.participant_id = p.id

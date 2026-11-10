@@ -12,7 +12,6 @@ func ReadConfig(path string) {
 
 	viper.SetConfigName("config")
 	viper.AddConfigPath(path)
-	viper.AutomaticEnv()
 	viper.SetConfigType("yml")
 
 	viper.SetEnvPrefix("VFEEG_BACKEND")

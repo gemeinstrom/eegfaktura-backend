@@ -23,6 +23,9 @@ var (
 	instance IMessageBroker
 )
 
+// listenStopLimit is how long Stop waits for the handler running in Listen.
+const listenStopLimit = 2 * time.Second
+
 type CloseC struct {
 	C      chan bool
 	closed bool
@@ -65,6 +68,7 @@ type MessageBroker struct {
 	ErrorC        chan ErrorMessage
 	callbackStore map[model.EdaProtocol]model.SubscribeHandler
 	close         *CloseC
+	stopped       chan struct{} // closed when Listen has returned
 	cl            mqtt.Client
 }
 
@@ -92,6 +96,7 @@ func NewMessageBroker() (*MessageBroker, error) {
 		errC,
 		make(map[model.EdaProtocol]model.SubscribeHandler),
 		NewCloseC(),
+		make(chan struct{}),
 		nil,
 	}
 	return messageBrokerV2, nil
@@ -161,7 +166,7 @@ func (m *MessageBroker) ConfigRoutes(cl mqtt.Client) {
 	})
 
 	cl.AddRoute("eda/response/error", func(client mqtt.Client, msg mqtt.Message) {
-		log.Infof("Error Message from MQTT: Topic: %v Msg: %+v QoS: %d", msg.Topic(), string(msg.Payload()), msg.Qos())
+		log.Infof("Error Message from MQTT: Topic: %v Size: %d QoS: %d", msg.Topic(), len(msg.Payload()), msg.Qos())
 		m.ErrorC <- ErrorMessage{
 			msg.Payload()}
 	})
@@ -169,7 +174,7 @@ func (m *MessageBroker) ConfigRoutes(cl mqtt.Client) {
 
 func (m *MessageBroker) Listen() {
 	log.Info("Broker start listening ...")
-	m.close = NewCloseC()
+	defer close(m.stopped)
 
 	for {
 		select {
@@ -200,8 +205,16 @@ func (m *MessageBroker) Unsubscribe(subscriptions ...model.Subscriptions) {
 	}
 }
 
+// Stop returns when Listen has returned, so no handler queues a mail or writes after it; the caller
+// stops the mail worker and closes the database next. A handler that needs longer than
+// listenStopLimit is left behind, with an error line.
 func (m *MessageBroker) Stop() {
 	m.close.SafeClose()
+	select {
+	case <-m.stopped:
+	case <-time.After(listenStopLimit):
+		log.Errorf("Broker: a handler is still running after %v", listenStopLimit)
+	}
 	if m.cl != nil {
 		m.cl.Disconnect(500)
 	}
@@ -241,17 +254,43 @@ func (m *MessageBroker) received(inbound InboundMessage) {
 	}
 }
 
+// parseOnlineState reads the online flag of a pontononlinestate command. found is false
+// when the payload has no online field; a non-boolean value is an error.
+func parseOnlineState(payload []byte) (online, found bool, err error) {
+	msg := map[string]interface{}{}
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		return false, false, err
+	}
+	value, found := msg["online"]
+	if !found {
+		return false, false, nil
+	}
+	online, isBool := value.(bool)
+	if !isBool {
+		return false, false, fmt.Errorf("field online is not a boolean")
+	}
+	return online, true, nil
+}
+
 func (m *MessageBroker) command(cmd CommandMessage) {
+
+	// Same as in received(): a malformed command must not kill the broker goroutine.
+	defer func() {
+		if r := recover(); r != nil {
+			log.WithField("tenant", cmd.tenant).
+				WithField("command", cmd.cmd).
+				Errorf("recovered from panic while handling MQTT command: %v\n%s", r, debug.Stack())
+		}
+	}()
+
 	switch cmd.cmd {
 	case "pontononlinestate":
-		msg := map[string]interface{}{}
-		err := json.Unmarshal(cmd.msg, &msg)
+		online, ok, err := parseOnlineState(cmd.msg)
 		if err != nil {
-			log.Errorf("Error from MQTT: (%s) cmd: %v - %v", cmd.tenant, cmd, err)
+			log.Errorf("Error from MQTT: (%s) cmd: %s - %v", cmd.tenant, cmd.cmd, err)
 			return
 		}
 
-		online, ok := msg["online"]
 		if ok {
 			log.Infof("Update EEG Online State to %v", online)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -263,7 +302,7 @@ func (m *MessageBroker) command(cmd CommandMessage) {
 				return
 			}
 
-			if err := db.UpdateEegOnlineState(ctx, strings.ToUpper(cmd.tenant), online.(bool)); err != nil {
+			if err := db.UpdateEegOnlineState(ctx, strings.ToUpper(cmd.tenant), online); err != nil {
 				log.Errorf("Error Command: %+v", err)
 			}
 		}
@@ -272,11 +311,11 @@ func (m *MessageBroker) command(cmd CommandMessage) {
 		var registerMsg model.RegisterEegRequest
 		err := json.Unmarshal(cmd.msg, &registerMsg)
 		if err != nil {
-			log.Errorf("Error from MQTT: (%s) cmd: %v - %v", cmd.tenant, cmd, err)
+			log.Errorf("Error from MQTT: (%s) cmd: %s - %v", cmd.tenant, cmd.cmd, err)
 			return
 		}
 		eeg := factory.GetEegFromRegisterEeg(registerMsg)
-		log.Printf("Register EEG: %+v", eeg)
+		log.Printf("Register EEG: %s", eeg.Id)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

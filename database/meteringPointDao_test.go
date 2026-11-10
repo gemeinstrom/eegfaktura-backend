@@ -9,6 +9,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/doug-martin/goqu/v9"
 	"github.com/jjeffery/civil"
+	"github.com/lib/pq"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -319,19 +320,76 @@ func Test_RegisterMeteringPoint(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mDB, mock, err := InitMockDatabase()
-			if err != nil {
-				t.Fatalf("An error occurred while creating mock: %s", err)
-			}
+			mDB, mock := newMockDatabase(t)
 
+			// registerMeteringPoint checks the participant's tenant first (#59).
+			mock.ExpectQuery(`SELECT "tenant" FROM "base"."participant"`).
+				WillReturnRows(sqlmock.NewRows([]string{"tenant"}).AddRow(tt.args.tenant))
 			mock.ExpectBegin()
+			// platform#247: is the meter already at this member?
+			mock.ExpectQuery(`SELECT "flag" FROM "base"."meteringpoint"`).WillReturnRows(sqlmock.NewRows([]string{"flag"}))
+			expectGridOperatorLookup(mock)
 			mock.ExpectExec("INSERT (.+) \"base\".\"meteringpoint\"").WillReturnResult(sqlmock.NewResult(1, 1))
 			//mock.Mock.ExpectExec("INSERT INTO \"base\".\"participant_meter_state\" (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
 			mock.ExpectExec("INSERT INTO \"base\".\"metering_partition_factor\" (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectCommit()
 
 			assert.NoError(t, mDB.RegisterMeteringPoint(context.Background(), tt.args.tenant, "userId", tt.args.participantId, tt.args.point))
 		})
 	}
+}
+
+// platform#247: a metering point that is already at the member is not inserted a second time; the caller gets
+// ErrMeterExistsAtParticipant instead of the key violation. An assigned row (shown in the member's list, e.g.
+// inactive) points to "Zählpunkt aktivieren"; a moved or archived row (hidden) to the support.
+func Test_RegisterMeteringPoint_existingAtParticipant(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		flag model.ProcessFlag
+		text string
+	}{
+		{"assigned", model.F_ASSIGNED, model.MeterExistsAtParticipantText},
+		{"moved", model.F_MOVED, model.MeterHiddenAtParticipantText},
+		{"archived", model.F_DELETED, model.MeterHiddenAtParticipantText},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mDB, mock := newMockDatabase(t)
+			mock.ExpectQuery(`SELECT "tenant" FROM "base"."participant"`).
+				WillReturnRows(sqlmock.NewRows([]string{"tenant"}).AddRow("DR"))
+			mock.ExpectBegin()
+			mock.ExpectQuery(`SELECT "flag" FROM "base"."meteringpoint"`).WillReturnRows(sqlmock.NewRows([]string{"flag"}).AddRow(int(tt.flag)))
+			mock.ExpectRollback()
+
+			err := mDB.RegisterMeteringPoint(context.Background(), "DR", "userId", "12",
+				&model.MeteringPoint{MeteringPoint: "AT0030000000000000000000000000001"})
+			var ve *model.VfeegError
+			require.True(t, errors.As(err, &ve), "got %v", err)
+			assert.Equal(t, model.ErrMeterExistsAtParticipant(nil).Code, ve.Code)
+			assert.Equal(t, tt.text, model.UserText(err))
+			assert.NoError(t, mock.ExpectationsWereMet(), "no insert after the check")
+		})
+	}
+}
+
+// platform#247: two requests at the same time both pass the check; the second insert hits the primary key and is
+// answered like the check (review of backend#157: VfeegError has no Unwrap, so this needs its own unwrapping).
+func Test_RegisterMeteringPoint_concurrentKeyViolation(t *testing.T) {
+	mDB, mock := newMockDatabase(t)
+	mock.ExpectQuery(`SELECT "tenant" FROM "base"."participant"`).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant"}).AddRow("DR"))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT "flag" FROM "base"."meteringpoint"`).WillReturnRows(sqlmock.NewRows([]string{"flag"}))
+	expectGridOperatorLookup(mock)
+	mock.ExpectExec("INSERT (.+) \"base\".\"meteringpoint\"").
+		WillReturnError(&pq.Error{Code: "23505", Constraint: "meteringpointpk", Message: "duplicate key value"})
+	mock.ExpectRollback()
+
+	err := mDB.RegisterMeteringPoint(context.Background(), "DR", "userId", "12",
+		&model.MeteringPoint{MeteringPoint: "AT0030000000000000000000000000001"})
+	var ve *model.VfeegError
+	require.True(t, errors.As(err, &ve), "got %v", err)
+	assert.Equal(t, model.ErrMeterExistsAtParticipant(nil).Code, ve.Code)
+	assert.Equal(t, model.MeterExistsAtParticipantText, model.UserText(err))
 }
 
 func Test_MeteringPointRevoke(t *testing.T) {
@@ -407,6 +465,9 @@ func Test_AddMultipleMeteringPoints(t *testing.T) {
 
 	db, err := GetDB(context.Background())
 	require.NoError(t, err)
+	// other tests add members to TE000001 too: count the two this test registers
+	before, err := db.GetParticipants(context.Background(), "TE000001")
+	require.NoError(t, err)
 
 	// Register new Meteringpoint
 	err = db.RegisterMeteringPoint(context.Background(), "TE000001", "test", "ea9942da-03da-11ee-b82b-5a985b4b033a", meter)
@@ -477,7 +538,7 @@ func Test_AddMultipleMeteringPoints(t *testing.T) {
 	p, err := db.GetParticipants(context.Background(), "TE000001")
 	require.NoError(t, err)
 
-	assert.Equal(t, 3, len(p))
+	assert.Equal(t, len(before)+2, len(p))
 
 	p1 := findP(p, "Peter", "Obermüller")
 	assert.NotNil(t, p1)
@@ -661,7 +722,7 @@ func Test_MeteringPointIntegration(t *testing.T) {
 		{
 			name: "Revoke Metering Point",
 			test: func(t *testing.T) error {
-				return db.MeteringPointRevoke(context.Background(), 
+				return db.MeteringPointRevoke(context.Background(),
 					tenant,
 					meter.MeteringPoint,
 					civil.Today(),
@@ -1007,6 +1068,70 @@ func Test_UpdateMeteringPoint(t *testing.T) {
 	require.Equal(t, expectedactiveDate, mUnderTest.State.ActiveSince.Date)
 }
 
+// eegfaktura-dev#56 #14: the update does not store TechCode/FuelCode and hands back the stored ones, not those sent.
+func Test_UpdateMeteringPoint_returnsStoredCodes(t *testing.T) {
+	const tenant, participant, meter = "TE000002", "ea9942db-03da-11ee-b82b-5a985b4b033a", "AT0030000000000000000000030056114"
+	db, err := GetDB(context.Background())
+	require.NoError(t, err)
+	cleanup := func() {
+		_, err := testDB.DbInstance.Exec(`DELETE FROM base.meteringpoint WHERE tenant = $1 AND metering_point_id = $2`, tenant, meter)
+		require.NoError(t, err)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+	_, err = testDB.DbInstance.Exec(`INSERT INTO base.meteringpoint (metering_point_id, participant_id, tenant, direction,
+		status, process_state, "modifiedAt", "modifiedBy", "registeredSince", tech_code, fuel_code)
+		VALUES ($1, $2, $3, 'GENERATION', 'ACTIVE', 'ACTIVE', now(), 'test', '2023-01-01', 'PV', 'E000')`, meter, participant, tenant)
+	require.NoError(t, err)
+	codes := func() (null.String, null.String) {
+		var tech, fuel null.String
+		require.NoError(t, testDB.DbInstance.QueryRow(`SELECT tech_code, fuel_code FROM base.meteringpoint
+			WHERE tenant = $1 AND metering_point_id = $2`, tenant, meter).Scan(&tech, &fuel))
+		return tech, fuel
+	}
+
+	m := model.MeteringPoint{MeteringPoint: meter, Direction: model.GENERATOR, Status: model.S_ACTIVE,
+		TechCode: null.StringFrom("HACK"), FuelCode: null.StringFrom("HACK"),
+		State: &model.MeterState{ActiveSince: civil.NullDate{Date: civil.DateFor(2023, 1, 1), Valid: true}}}
+	require.NoError(t, db.UpdateMeteringPoint(context.Background(), tenant, "test", participant, meter, &m))
+	assert.Equal(t, null.StringFrom("PV"), m.TechCode)
+	assert.Equal(t, null.StringFrom("E000"), m.FuelCode)
+	tech, fuel := codes()
+	assert.Equal(t, null.StringFrom("PV"), tech, "stored")
+	assert.Equal(t, null.StringFrom("E000"), fuel, "stored")
+
+	// no row of this participant: nothing stored, no codes handed back
+	m.TechCode = null.StringFrom("HACK")
+	require.NoError(t, db.UpdateMeteringPoint(context.Background(), tenant, "test", "00000000-0000-4000-8000-000000000000", meter, &m))
+	assert.False(t, m.TechCode.Valid)
+}
+
+// eegfaktura-dev#56 #14 (register): a new metering point stores no TechCode/FuelCode and hands back none, not those
+// sent.
+func Test_RegisterMeteringPoint_returnsNoUnstoredCodes(t *testing.T) {
+	const tenant, participant, meter = "TE000001", "ea9942da-03da-11ee-b82b-5a985b4b033a", "AT0030000000000000000000030056014"
+	cleanup := func() {
+		_, err := testDB.DbInstance.Exec(`DELETE FROM base.metering_partition_factor WHERE tenant = $1 AND metering_point_id = $2`, tenant, meter)
+		require.NoError(t, err)
+		_, err = testDB.DbInstance.Exec(`DELETE FROM base.meteringpoint WHERE tenant = $1 AND metering_point_id = $2`, tenant, meter)
+		require.NoError(t, err)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+	db, err := GetDB(context.Background())
+	require.NoError(t, err)
+
+	m := &model.MeteringPoint{MeteringPoint: meter, Direction: model.GENERATOR,
+		TechCode: null.StringFrom("HACK"), FuelCode: null.StringFrom("HACK")}
+	require.NoError(t, db.RegisterMeteringPoint(context.Background(), tenant, "test", participant, m))
+	assert.False(t, m.TechCode.Valid, "techCode handed back")
+	assert.False(t, m.FuelCode.Valid, "fuelCode handed back")
+	var tech, fuel null.String
+	require.NoError(t, testDB.DbInstance.QueryRow(`SELECT tech_code, fuel_code FROM base.meteringpoint
+		WHERE tenant = $1 AND metering_point_id = $2`, tenant, meter).Scan(&tech, &fuel))
+	assert.False(t, tech.Valid || fuel.Valid, "nothing stored")
+}
+
 func Test_MeteringPointChangePartFact(t *testing.T) {
 	db, err := GetDB(context.Background())
 	require.NoError(t, err)
@@ -1030,7 +1155,7 @@ func Test_MeteringPointChangePartFact(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.wantErr(t, db.MeteringPointChangePartFactor(context.Background(), tt.args.tenant, tt.args.meters), fmt.Sprintf("MeteringPointChangePartFact(%v, %v)", tt.args.tenant, tt.args.meters))
+			tt.wantErr(t, db.MeteringPointChangePartFactor(context.Background(), tt.args.tenant, "", tt.args.meters), fmt.Sprintf("MeteringPointChangePartFact(%v, %v)", tt.args.tenant, tt.args.meters))
 		})
 	}
 }
@@ -1218,10 +1343,11 @@ func TestMeteringPointRevokeByConsentId_INIT(t *testing.T) {
 	consentEnd := civil.DateOf(time.UnixMilli(m.ConsentEnd))
 	fmt.Printf("Consent-End: %+s\n", consentEnd)
 
-	tenant, err := db.MeteringPointRevokeByConsentId(context.Background(), &consentId, meterId, consentEnd)
+	revoked, err := db.MeteringPointRevokeByConsentId(context.Background(), "", &consentId, meterId, consentEnd)
+	tenants := TenantNames(revoked)
 	require.NoError(t, err)
-	require.NotNil(t, tenant)
-	require.Equal(t, "TE100201", *tenant)
+	require.Equal(t, []string{"TE100201"}, tenants)
+	assert.False(t, revoked[0].WasActive, "an INIT metering point was not active (platform#116)")
 
 	meters, err := db.FindInactiveMeteringById(context.Background(), "TE100201", meterId)
 	require.NoError(t, err)
@@ -1256,10 +1382,11 @@ func TestMeteringPointRevokeByConsentId_ACTIVE(t *testing.T) {
 	consentEnd := civil.DateOf(time.UnixMilli(m.ConsentEnd))
 	fmt.Printf("Consent-End: %+s\n", consentEnd)
 
-	tenant, err := db.MeteringPointRevokeByConsentId(context.Background(), &consentId, meterId, consentEnd)
+	revoked, err := db.MeteringPointRevokeByConsentId(context.Background(), "", &consentId, meterId, consentEnd)
+	tenants := TenantNames(revoked)
 	require.NoError(t, err)
-	require.NotNil(t, tenant)
-	require.Equal(t, "TE100201", *tenant)
+	require.Equal(t, []string{"TE100201"}, tenants)
+	assert.True(t, revoked[0].WasActive, "an ACTIVE metering point ends its participation (platform#116)")
 
 	meters, err := db.FindNewMeteringById(context.Background(), "TE100201", meterId)
 	require.NoError(t, err)
@@ -1302,7 +1429,10 @@ func TestRemoveMeteringPoint(t *testing.T) {
 	require.NotNil(t, m)
 
 	assert.NoError(t, db.MeteringPointsSetStatus(context.Background(), "TE000001", model.REVOKED, nil, []string{"AT0030000000000000000000030000999"}, nil, nil))
-	assert.NoError(t, db.RemoveMeteringPoint(context.Background(), "TE000001", "ea9942da-03da-11ee-b82b-5a985b4b033a", "AT0030000000000000000000030000999"))
+	assert.Error(t, db.RemoveMeteringPoint(context.Background(), "TE000001", "ea9942da-03da-11ee-b82b-5a985b4b033a", "AT0030000000000000000000030000999"))
+
+	assert.NoError(t, db.MeteringPointsSetStatus(context.Background(), "TE000001", model.PENDING, nil, []string{"AT0030000000000000000000030000999"}, nil, nil))
+	assert.Error(t, db.RemoveMeteringPoint(context.Background(), "TE000001", "ea9942da-03da-11ee-b82b-5a985b4b033a", "AT0030000000000000000000030000999"))
 
 	m, err = db.FindMeteringByStatus(context.Background(), "TE000001", "AT0030000000000000000000030000999", model.S_INIT)
 	require.NoError(t, err)
