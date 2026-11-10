@@ -62,7 +62,6 @@ func parseExcelDate(cell string) time.Time {
 		var days, _ = strconv.ParseFloat(cell, 64)
 		return excelEpoch.Add(time.Second * time.Duration(days*86400))
 	}
-	return time.Now()
 }
 
 func StringToTime(date string) time.Time {

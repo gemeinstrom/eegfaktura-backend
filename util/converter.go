@@ -1,7 +1,6 @@
 package util
 
 import (
-	"fmt"
 	"reflect"
 )
 
@@ -16,8 +15,6 @@ func ConvertMapToStruct(m map[string]interface{}, s interface{}) error {
 		case reflect.Ptr:
 			ConvertMapToStruct(m[sType.Field(i).Name].(map[string]interface{}), stValue.Interface())
 		}
-		fmt.Printf("Name: %s, Type: %+v, value: %+v\n", sType.Field(i).Name, field.Type().Name(), m[sType.Field(i).Name])
-
 		if value, ok := m[sType.Field(i).Name]; ok {
 			stValue.Field(i).Set(reflect.ValueOf(value))
 		}

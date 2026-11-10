@@ -118,6 +118,24 @@ func (r *AdminService) UpdateValue(ctx context.Context, request *protobuf.Update
 			fields[k] = v
 		}
 
+		// The generic EEG update refuses "online" (write-protected). After the
+		// Ponton registration admin-backend sets it through this call, so it
+		// goes through the dedicated online-state update instead.
+		if v, ok := request.Value["online"]; ok {
+			online, perr := strconv.ParseBool(v)
+			if perr != nil {
+				return &protobuf.UpdateEegReply{Status: 501, Message: "Can not update EEG due to an invalid online value!"}, nil
+			}
+			if err = db.UpdateEegOnlineState(ctx, request.Tenant, online); err != nil {
+				logrus.Error(err)
+				return &protobuf.UpdateEegReply{Status: 500, Message: "Can not update EEG due to a database issue!"}, err
+			}
+			delete(fields, "online")
+			if len(fields) == 0 {
+				return &protobuf.UpdateEegReply{Status: 201, Message: "EEG updated successfully"}, nil
+			}
+		}
+
 		if err = db.UpdateEegPartial(ctx, request.Tenant, fields); err != nil {
 			logrus.Error(err)
 			return &protobuf.UpdateEegReply{Status: 500, Message: "Can not update EEG due to a database issue!"}, err

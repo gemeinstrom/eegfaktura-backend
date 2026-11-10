@@ -1,6 +1,33 @@
 package model
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+// 261031-mm7: logs use Error(), which names no address; a person gets the address through UserText.
+func TestValidateEmailList_AddressStaysOutOfTheLog(t *testing.T) {
+	_, err := ValidateEmailList("anna@example.org;kaputt@adresse")
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !errors.Is(err, ErrInvalidEmail) {
+		t.Error("not ErrInvalidEmail")
+	}
+	for name, e := range map[string]error{"plain": err, "wrapped": fmt.Errorf("save: %w", err), "VfeegError": ErrParseJson(err)} {
+		if strings.Contains(e.Error(), "kaputt@adresse") {
+			t.Errorf("%s: Error() names the address: %s", name, e.Error())
+		}
+		if got := UserText(e); got != "Die E-Mail-Adresse „kaputt@adresse“ ist ungültig." {
+			t.Errorf("%s: UserText = %q", name, got)
+		}
+	}
+	if got := UserText(errors.New("other")); got != "other" {
+		t.Errorf("UserText of another error = %q", got)
+	}
+}
 
 func TestNormalizeEmailList(t *testing.T) {
 	tests := []struct {

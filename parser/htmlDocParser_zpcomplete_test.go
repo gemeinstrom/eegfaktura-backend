@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"at.ourproject/vfeeg-backend/config"
+	"at.ourproject/vfeeg-backend/config/configtest"
 	"at.ourproject/vfeeg-backend/model"
-	"github.com/spf13/viper"
 	"gopkg.in/guregu/null.v4"
 )
 
@@ -16,7 +16,7 @@ import (
 // struct built in sendMailFromTemplate. If the field is dropped again the
 // render fails with "can't evaluate field MeteringPoint" and the mail is lost.
 func TestParseTemplateZpCompleteMeteringPoint(t *testing.T) {
-	viper.Set("file-content.templates", "../public")
+	configtest.Set(t, "file-content.templates", "../public")
 
 	eeg := &model.Eeg{
 		Name:          "TE-EEG",
@@ -46,18 +46,12 @@ func TestParseTemplateZpCompleteMeteringPoint(t *testing.T) {
 	}
 }
 
-// TestZpCompleteMailRendersFromEmbeddedDefault proves the hybrid-embed
-// behaviour: with nothing seeded on the data volume, the zp-complete
-// ("Zählpunkt aktiv") mail — config, template and inline logo — still resolves
-// from the defaults embedded in the binary. This is what lets a fresh
-// deployment send the mail without hand-seeding the PVC.
+// TestZpCompleteMailRendersFromEmbeddedDefault: the zp-complete ("Zählpunkt
+// aktiv") mail — config and template — renders from the defaults embedded in
+// the binary, so a deployment sends it without anything on the PVC. Since
+// default version 2 it has no inline logo; the fixed footer replaces it.
 func TestZpCompleteMailRendersFromEmbeddedDefault(t *testing.T) {
-	viper.Set("file-content.templates", t.TempDir()) // empty: no template on the volume
-
-	fsys, source := resolveTemplateSource("any-tenant", "zp-complete-mail-template.toml")
-	if source != "embedded" {
-		t.Fatalf("expected the embedded defaults to be used, got source %q", source)
-	}
+	fsys := embeddedTemplates()
 
 	cfg, err := config.ReadActivationMailTemplateConfig(fsys, "zp-complete-mail-template.toml")
 	if err != nil {
@@ -89,8 +83,10 @@ func TestZpCompleteMailRendersFromEmbeddedDefault(t *testing.T) {
 		t.Errorf("rendered mail missing expected content; got:\n%s", body)
 	}
 
-	inline := buildInlineContent(fsys, cfg.InlinePictures)
-	if len(inline) != 1 || inline[0].Filecontent.Len() == 0 {
-		t.Errorf("expected one non-empty inline logo from the embed, got %d", len(inline))
+	if body := buf.String(); strings.Contains(body, "versandt durch") || strings.Contains(body, "eegfaktura-logo") {
+		t.Errorf("the default must not contain \"versandt durch\" or the logo; got:\n%s", body)
+	}
+	if inline := buildInlineContent(fsys, cfg.InlinePictures); len(inline) != 0 {
+		t.Errorf("expected no inline picture, got %d", len(inline))
 	}
 }

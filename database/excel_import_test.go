@@ -21,18 +21,23 @@ import (
 const testCommunityId = "AT00999900000TC000009000000000001"
 
 func buildImportSheet(t *testing.T, rows [][]interface{}) *excelize.File {
+	return buildImportSheetWithColumns(t, nil, rows)
+}
+
+// buildImportSheetWithColumns appends optional columns (e.g. "Einzugsart") after the template's.
+func buildImportSheetWithColumns(t *testing.T, extra []interface{}, rows [][]interface{}) *excelize.File {
 	t.Helper()
 	f := excelize.NewFile()
 	const sheet = "EEG Stammdaten"
 	_, err := f.NewSheet(sheet)
 	require.NoError(t, err)
 
-	header := []interface{}{
+	header := append([]interface{}{
 		"Netzbetreiber", "Gemeinschafts-ID", "PLZ", "Ort", "Straße", "Hausnummer",
 		"Zählpunkt", "Energierichtung", "Name 1", "Name 2", "BusinessRole",
 		"Mitglied seit", "email", "MitgliedsNr", "Zählpunktstatus",
 		"registriert seit", "Zugeteilte Menge in Prozent",
-	}
+	}, extra...)
 	require.NoError(t, f.SetSheetRow(sheet, "A1", &[]interface{}{"[### Leerzeile für Importer ###]"}))
 	require.NoError(t, f.SetSheetRow(sheet, "A2", &header))
 	for i, r := range rows {
@@ -49,7 +54,7 @@ func transformSheet(t *testing.T, f *excelize.File, online bool) ([]*model.EegPa
 	require.NoError(t, err)
 	defer rows.Close()
 	importLog := &model.Log{Operation: "Excel Master Data Import", Messages: []*model.LogMessage{}}
-	return transformExcelData(rows, func(id string) string { return id }, online, testCommunityId, importLog), importLog
+	return transformExcelData(context.Background(), rows, func(id string) string { return id }, online, testCommunityId, importLog), importLog
 }
 
 // Template column "Mitglied seit" must become the participant's
@@ -133,8 +138,8 @@ func Test_transformExcelData_partFact(t *testing.T) {
 }
 
 // Silently skipped rows must surface in the import log: data-looking rows with
-// an invalid grid operator and rows whose name cannot be extracted. A trailing
-// space in the operator column must no longer discard the row.
+// rows whose name cannot be extracted. Column A ("Netzbetreiber") is optional
+// since platform#107: its value no longer decides whether a row is imported.
 func Test_transformExcelData_skipReporting(t *testing.T) {
 	f := buildImportSheet(t, [][]interface{}{
 		{"at009999", testCommunityId, "4020", "Linz", "Weg", "1",
@@ -151,15 +156,67 @@ func Test_transformExcelData_skipReporting(t *testing.T) {
 
 	participants, importLog := transformSheet(t, f, false)
 
-	// nur die Zeile mit nachgestelltem Leerzeichen wird (jetzt) importiert
-	require.Len(t, participants, 1)
-	assert.Equal(t, "Trail", participants[0].FirstName)
-	assert.Equal(t, "AT009999", participants[0].MeteringPoint[0].GridOperatorId.String)
+	// Kleinschreibung und Leerzeichen in Spalte A sind egal, der Netzbetreiber kommt
+	// aus der Zählpunktnummer
+	require.Len(t, participants, 2)
+	assert.Equal(t, "Lower", participants[0].FirstName)
+	assert.Equal(t, "Trail", participants[1].FirstName)
+	for _, p := range participants {
+		assert.Equal(t, "AT009999", p.MeteringPoint[0].GridOperatorId.String)
+	}
 
-	// ungültiger Netzbetreiber + Name-Split-Fehler werden gemeldet, die leere Zeile nicht
+	// nur der Name-Split-Fehler wird gemeldet, die leere Zeile nicht
+	require.Len(t, importLog.Messages, 1)
+	assert.Equal(t, "E_PARTICIPANT_1001", importLog.Messages[0].MessageCode)
+}
+
+// platform#107: the grid operator comes from the metering point number (plus
+// alias list), column A is optional and only compared.
+func Test_transformExcelData_gridOperatorFromMeteringPoint(t *testing.T) {
+	defer func(orig func() map[string]string) { gridOperatorAlias = orig }(gridOperatorAlias)
+	gridOperatorAlias = func() map[string]string { return map[string]string{"AT008200": "AT008000"} }
+
+	row := func(colA, zp, name string) []interface{} {
+		return []interface{}{colA, testCommunityId, "8160", "Weiz", "Weg", "1",
+			zp, "CONSUMPTION", name, "Muster", "privat", "", "", "", "ACTIVE", "", ""}
+	}
+	f := buildImportSheet(t, [][]interface{}{
+		row("", "AT0030000000000000000000000000001", "Leer"),           // column A empty
+		row("AT003000", "AT0030000000000000000000000000002", "Gleich"), // same as derived
+		row("AT003100", "AT0030000000000000000000000000003", "Anders"), // differs -> hint
+		row("", "AT0082000816000000000000004269401", "Alias"),          // alias -> hint
+		row("AT008000", "AT0082000816000000000000004269402", "AliasA"), // alias, A = target
+	})
+
+	participants, importLog := transformSheet(t, f, false)
+	require.Len(t, participants, 5)
+	want := []string{"AT003000", "AT003000", "AT003000", "AT008000", "AT008000"}
+	for i, p := range participants {
+		assert.Equal(t, want[i], p.MeteringPoint[0].GridOperatorId.String, p.FirstName)
+	}
+
 	require.Len(t, importLog.Messages, 2)
-	assert.Equal(t, "E_PARTICIPANT_1002", importLog.Messages[0].MessageCode)
-	assert.Equal(t, "E_PARTICIPANT_1001", importLog.Messages[1].MessageCode)
+	for _, m := range importLog.Messages {
+		assert.Equal(t, "W_GRID_OPERATOR_IGNORED", m.MessageCode)
+	}
+	assert.Equal(t, "AT0030000000000000000000000000003", importLog.Messages[0].Identifier)
+	assert.Equal(t, "AT0082000816000000000000004269401", importLog.Messages[1].Identifier)
+}
+
+// Without the "Netzbetreiber" column the header is found via "Zählpunkt".
+func Test_transformExcelData_withoutGridOperatorColumn(t *testing.T) {
+	f := excelize.NewFile()
+	const sheet = "EEG Stammdaten"
+	_, err := f.NewSheet(sheet)
+	require.NoError(t, err)
+	header := []interface{}{"Gemeinschafts-ID", "Zählpunkt", "Energierichtung", "Name 1", "Name 2", "Zählpunktstatus"}
+	require.NoError(t, f.SetSheetRow(sheet, "A1", &header))
+	require.NoError(t, f.SetSheetRow(sheet, "A2", &[]interface{}{testCommunityId, "AT0030000000000000000000000000009", "CONSUMPTION", "Ohne", "Spalte", "ACTIVE"}))
+
+	participants, importLog := transformSheet(t, f, false)
+	require.Len(t, participants, 1)
+	assert.Equal(t, "AT003000", participants[0].MeteringPoint[0].GridOperatorId.String)
+	assert.Empty(t, importLog.Messages)
 }
 
 // Rows of one member (one row per metering point) merge by first+last name —
@@ -311,14 +368,14 @@ func Test_transformExcelData_shippedTemplate(t *testing.T) {
 	require.NoError(t, err)
 	defer reader.Close()
 
-	f, err := openReader(reader, "260716-vorlage-import-stammdaten.xlsx")
+	f, cleanup, err := openReader(reader, "260716-vorlage-import-stammdaten.xlsx")
 	require.NoError(t, err)
-	defer f.Close()
+	defer cleanup()
 
 	rows, err := f.Rows("EEG Stammdaten")
 	require.NoError(t, err)
 	importLog := &model.Log{Operation: "Excel Master Data Import", Messages: []*model.LogMessage{}}
-	participants := transformExcelData(rows, func(id string) string { return id }, false, "AT00300000000RC101519000000912345", importLog)
+	participants := transformExcelData(context.Background(), rows, func(id string) string { return id }, false, "AT00300000000RC101519000000912345", importLog)
 
 	assert.Empty(t, importLog.Messages)
 	require.Len(t, participants, 1)
@@ -363,4 +420,94 @@ func Test_transformExcelData_communityId(t *testing.T) {
 	assert.Equal(t, "AT00000000000TC999999000000000009", importLog.Messages[0].Identifier)
 	assert.Equal(t, "E_COMMUNITY_1000", importLog.Messages[1].MessageCode)
 	assert.Equal(t, "", importLog.Messages[1].Identifier)
+}
+
+// Optional column "Einzugsart" (platform#143): CORE/B2B/NONE/"Kein SEPA", case, blanks and hyphens
+// ignored; empty stays empty (not debited), an unknown value is reported and left empty.
+func debitRow(nr int, name, debit string) []interface{} {
+	n := string(rune('0' + nr))
+	return []interface{}{"AT009999", testCommunityId, "4020", "Linz", "Weg", "1",
+		"AT00999900000000000000000000000" + "1" + n, "CONSUMPTION", name, "Tester", "privat",
+		"", name + "@example.org", "00" + n, "ACTIVE", "", "100", debit}
+}
+
+func debitTypes(participants []*model.EegParticipant) []null.String {
+	got := []null.String{}
+	for _, p := range participants {
+		got = append(got, p.BankAccount.SepaDirectDebit)
+	}
+	return got
+}
+
+func Test_transformExcelData_debitType(t *testing.T) {
+	f := buildImportSheetWithColumns(t, []interface{}{"Einzugsart"}, [][]interface{}{
+		debitRow(1, "Anna", "CORE"), debitRow(2, "Berta", " b2b "), debitRow(3, "Clara", "Kein  SEPA"),
+		debitRow(4, "Dora", "kein-sepa"), debitRow(5, "Emil", "none"), debitRow(6, "Franz", ""),
+		debitRow(7, "Gerda", "Lastschrift"),
+	})
+	participants, importLog := transformSheet(t, f, false)
+	require.Len(t, participants, 7)
+	assert.Equal(t, []null.String{
+		null.StringFrom("CORE"), null.StringFrom("B2B"), null.StringFrom("NONE"), null.StringFrom("NONE"),
+		null.StringFrom("NONE"), {}, {},
+	}, debitTypes(participants))
+	require.Len(t, importLog.Messages, 1)
+	assert.Contains(t, importLog.Messages[0].Message, "Lastschrift")
+	assert.Equal(t, "W_DEBIT_TYPE_UNKNOWN", importLog.Messages[0].MessageCode)
+}
+
+// The export's header "DebitType" is read as well.
+func Test_transformExcelData_debitTypeExportHeader(t *testing.T) {
+	f := buildImportSheetWithColumns(t, []interface{}{"DebitType"}, [][]interface{}{debitRow(1, "Anna", "B2B")})
+	participants, _ := transformSheet(t, f, false)
+	require.Len(t, participants, 1)
+	assert.Equal(t, null.StringFrom("B2B"), participants[0].BankAccount.SepaDirectDebit)
+}
+
+// A member on several rows: the first non-empty type counts, a different one is reported.
+func Test_transformExcelData_debitTypeSeveralRows(t *testing.T) {
+	row := func(nr int, debit string) []interface{} {
+		r := debitRow(nr, "Same", debit)
+		r[13] = "001" // same member number
+		return r
+	}
+	f := buildImportSheetWithColumns(t, []interface{}{"Einzugsart"}, [][]interface{}{row(1, ""), row(2, "Kein SEPA"), row(3, "CORE")})
+	participants, importLog := transformSheet(t, f, false)
+	require.Len(t, participants, 1)
+	require.Len(t, participants[0].MeteringPoint, 3)
+	assert.Equal(t, null.StringFrom("NONE"), participants[0].BankAccount.SepaDirectDebit)
+	require.Len(t, importLog.Messages, 1)
+	assert.Contains(t, importLog.Messages[0].Message, "different direct debit types")
+}
+
+// Without the column the debit type stays empty, as before.
+func Test_transformExcelData_debitTypeColumnMissing(t *testing.T) {
+	f := buildImportSheet(t, [][]interface{}{{"AT009999", testCommunityId, "4020", "Linz", "Weg", "1",
+		"AT0099990000000000000000000000001", "CONSUMPTION", "Ohne", "Spalte", "privat",
+		"", "o@example.org", "001", "ACTIVE", "", "100"}})
+	participants, _ := transformSheet(t, f, false)
+	require.Len(t, participants, 1)
+	assert.False(t, participants[0].BankAccount.SepaDirectDebit.Valid)
+}
+
+// Members created without a direct debit type are reported once (they are not debited).
+func Test_defaultDebitType(t *testing.T) {
+	member := func(iban, debit string) *model.EegParticipant {
+		p := &model.EegParticipant{}
+		p.BankAccount.Iban = null.StringFrom(iban)
+		if debit != "" {
+			p.BankAccount.SepaDirectDebit = null.StringFrom(debit)
+		}
+		return p
+	}
+	assert.True(t, missesDebitType(member("AT611904300234573201", "")))
+	assert.False(t, missesDebitType(member("AT611904300234573201", "CORE")))
+	assert.False(t, missesDebitType(member("AT611904300234573201", "NONE")))
+	assert.False(t, missesDebitType(member("", "")), "without IBAN there is no direct debit")
+
+	assert.Nil(t, defaultDebitTypeMessage(0))
+	m := defaultDebitTypeMessage(2)
+	require.NotNil(t, m)
+	assert.Equal(t, "W_DEBIT_TYPE_DEFAULT", m.MessageCode)
+	assert.Contains(t, m.Message, "2 new member(s)")
 }

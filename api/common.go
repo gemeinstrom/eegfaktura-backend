@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -12,35 +13,6 @@ type HttpError struct {
 	Code    int    `json:"code"`
 	Error   string `json:"error"`
 	Message string `json:"message"`
-}
-
-func UnauthorizedError() HttpError {
-	return HttpError{
-		401,
-		"Unauthorized",
-		"You are not authorized to access this resource",
-	}
-}
-func NotFoundError() *HttpError {
-	return &HttpError{
-		404,
-		"Not found",
-		"The requested resource was not found",
-	}
-}
-func DataAccessLayerError(message string) *HttpError {
-	return &HttpError{
-		400,
-		"Data access error",
-		message,
-	}
-}
-func BadRequestError(message string) *HttpError {
-	return &HttpError{
-		400,
-		"Bad Request",
-		message,
-	}
 }
 
 func BadProcessError(code int, message string) *HttpError {
@@ -59,21 +31,8 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(response)
 }
 
-func respondWithData(w http.ResponseWriter, code int, payload interface{}) {
-	//respondWithJSON(w, code, map[string]interface{}{"data": payload})
-	respondWithJSON(w, code, payload)
-}
-
 func respondWithError(w http.ResponseWriter, httpCode int, message string) {
 	respondWithJSON(w, httpCode, map[string]string{"error": message})
-}
-
-func responseWithOk(w http.ResponseWriter, code int, payload interface{}, withCache bool) {
-	if withCache {
-		w.Header().Add("Cache-Control", "max-age=60")
-		w.Header().Add("Vary", "X-Tenant")
-	}
-	respondWithJSON(w, code, map[string]interface{}{"data": payload})
 }
 
 func respondWithStatus(w http.ResponseWriter, code int) {
@@ -84,11 +43,12 @@ func respondWithHttpError(w http.ResponseWriter, httpCode int, error *HttpError)
 	respondWithJSON(w, httpCode, map[string]interface{}{"error": error})
 }
 
-func respondWith(w http.ResponseWriter, httpCode int, tenant string, data interface{}) {
+func respondWith(ctx context.Context, w http.ResponseWriter, httpCode int, tenant string, data interface{}) {
 	switch e := data.(type) {
 	case *model.VfeegError:
-		log.WithField("tenant", tenant).WithField("code", e.Code).WithError(e).Error(e.Error())
-		respondWithHttpError(w, httpCode, &HttpError{Error: e.Error(), Code: e.Code, Message: e.Error()})
+		log.WithContext(ctx).WithField("tenant", tenant).WithField("code", e.Code).WithError(e).Error(e.Error())
+		text := model.UserText(e)
+		respondWithHttpError(w, httpCode, &HttpError{Error: text, Code: e.Code, Message: text})
 		return
 	default:
 		respondWithJSON(w, httpCode, data)

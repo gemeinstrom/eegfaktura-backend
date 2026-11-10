@@ -32,6 +32,9 @@ type MeteringPointDBModel struct {
 	InactiveSince    civil.NullDate     `json:"inactivesince" goqu:"omitempty"`
 	Active           *ProcessStatus     `json:"active" goqu:"omitnil"`
 	Flag             *ProcessFlag       `json:"flat" goqu:"omitnil"`
+	// from the grid operator's metering point list; empty is never written (platform#229)
+	TechCode null.String `json:"techCode,omitempty" db:"tech_code" goqu:"omitempty"`
+	FuelCode null.String `json:"fuelCode,omitempty" db:"fuel_code" goqu:"omitempty"`
 }
 type MeteringPartFactDBModel struct {
 	MeteringPoint string             `json:"meteringPoint" db:"metering_point_id" goqu:"skipupdate"`
@@ -52,9 +55,9 @@ func ConvertToDbMeterList(ml []Meter) []*MeteringPointDBModel {
 
 func ConvertToDbMeter(m Meter) *MeteringPointDBModel {
 
-	getConsentId := func(consentId string) null.String {
-		if len(consentId) > 0 {
-			return null.StringFrom(consentId)
+	optionalString := func(v string) null.String {
+		if len(v) > 0 {
+			return null.StringFrom(v)
 		}
 		return null.String{}
 	}
@@ -79,7 +82,9 @@ func ConvertToDbMeter(m Meter) *MeteringPointDBModel {
 
 	return &MeteringPointDBModel{
 		MeteringPoint: m.MeteringPoint,
-		ConsentId:     getConsentId(m.ConsentID),
+		ConsentId:     optionalString(m.ConsentID),
+		TechCode:      optionalString(m.TechCode),
+		FuelCode:      optionalString(m.FuelCode),
 		//Transformer:      null.String{},
 		Direction:        m.Direction,
 		Status:           nil,

@@ -1,48 +1,34 @@
-# Go parameters
-GOCMD=go
-GOBUILD=$(GOCMD) build
-GOCLEAN=$(GOCMD) clean
-GOTEST=$(GOCMD) test
-GOGET=$(GOCMD) get
-DOCKER=docker
-BINARY_NAME=master-backend
-ORGANISATION=obpeter
-GLOBAL_ORG=eegfaktura
-PLATFORM=ghcr.io
+BINARY_NAME=vfeeg-backend
 
-VERSION=v0.3.1
+# tools/ is a directory: without .PHONY `make tools` would be "up to date" and install nothing
+.PHONY: all tools generate build test clean run protoc atlas-hash atlas-diff
 
-GOPATH := ${PWD}/..:${GOPATH}
-export GOPATH
+# The generated code (proto/*.pb.go, model/registration_model.go) is not tracked: run `make tools generate`
+# after cloning and after changing a .proto or a JSON schema. Needs protoc on the PATH (CI pins 29.3);
+# `tools` installs the generators at the versions in go.mod.
+all: generate test build
 
-all: test build
+tools:
+	go install google.golang.org/protobuf/cmd/protoc-gen-go google.golang.org/grpc/cmd/protoc-gen-go-grpc github.com/atombender/go-jsonschema
+
+generate: protoc
+	cd model && go generate ./...
+
 build:
-	$(GOBUILD) -o $(BINARY_NAME) -v -ldflags="-s -w"
+	go build -o $(BINARY_NAME) -ldflags="-s -w" server.go
 test:
-	$(GOTEST) -v ./...
+	go test ./...
 clean:
-	$(GOCLEAN)
+	go clean
 	rm -f $(BINARY_NAME)
-run:
-	$(GOBUILD) -o $(BINARY_NAME) -v ./...
-	./$(BINARY_NAME)
-
-docker-clean:
-	$(DOCKER) rmi ghcr.io/$(ORGANISATION)/$(BINARY_NAME):$(VERSION)
-
-docker:
-	$(DOCKER) build -t ghcr.io/$(ORGANISATION)/$(BINARY_NAME):$(VERSION) .
-#	$(DOCKER) image tag ghcr.io/$(ORGANISATION)/$(BINARY_NAME):$(VERSION) ghcr.io/$(GLOBAL_ORG)/$(BINARY_NAME):latest
-
-push: docker
-	$(DOCKER) push ghcr.io/$(ORGANISATION)/$(BINARY_NAME):$(VERSION)
-#	$(DOCKER) push ghcr.io/$(GLOBAL_ORG)/$(BINARY_NAME):latest
+run: build
+	./$(BINARY_NAME) -configPath .
 
 protoc:
 	protoc --experimental_allow_proto3_optional=true --proto_path=. --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative ./proto/*.proto
 
-altas-hash:
+atlas-hash:
 	atlas migrate hash --env local
 
-altas-migrage:
+atlas-diff:
 	atlas migrate diff --env local

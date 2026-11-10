@@ -52,7 +52,7 @@
 
         "area": {
           "type": "string",
-          "enum": ["REGIONAL", "LOCAL", "BEG", "GEA"]
+          "enum": ["REGIONAL", "LOCAL", "BEG", "GEA", "P2P", "EVA"]
         },
 
         "allocation": {

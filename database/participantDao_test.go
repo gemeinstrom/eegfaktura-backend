@@ -48,28 +48,25 @@ func TestUpdateParticipant(t *testing.T) {
 
 func TestRegisterParticipant(t *testing.T) {
 
-	mockDb, err := GetMockDb()
-	require.NoError(t, err)
+	db, mock := newMockDatabase(t)
 
 	participantJson := `{"businessRole":"EEG_PRIVATE","firstname":"Peter","lastname":"Obermüller","residentAddress":{"street":"Lambacherstraße","streetNumber":"39","zip":"4680","city":"Haag am Hausruck","type":"RESIDENCE"},"contact":{"phone":"06603611758","email":"obermueller.peter@gmail.com"},"accountInfo":{},"optionals":{},"status":"NEW","id":"e98b8619-7b6a-4836-baff-5489fb539535","role":"EEG_USER","billingAddress":{"street":"Lambacherstraße","streetNumber":"39","zip":"4680","city":"Haag am Hausruck","type":"BILLING"},"meters":[{"direction":"CONSUMPTION","status":"NEW","meteringPoint":"AT48124817243712897412","participantId":"e98b8619-7b6a-4836-baff-5489fb539535","tariffId":"a48d1990-a5a2-40c9-8d0a-77bed8e7dbcd","street":"Lambacherstraße","streetNumber":"39","zip":"4680","city":"Haag am Hausruck"}]}`
 
 	var p model.EegParticipant
-	err = json.NewDecoder(strings.NewReader(participantJson)).Decode(&p)
+	err := json.NewDecoder(strings.NewReader(participantJson)).Decode(&p)
 	assert.NoError(t, err)
 
 	fmt.Printf("Participant: %+v\n", p)
 
-	mockDb.Mock.ExpectBegin()
-	mockDb.Mock.ExpectQuery("INSERT (.+)").WillReturnRows(sqlmock.NewRows([]string{"id"}).FromCSVString("1")) //.WillReturnResult(sqlmock.NewResult(1, 1)) //.WithArgs("firstname", "lastname")
-	mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-	mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-	mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-	mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-	mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-	mockDb.Mock.ExpectCommit()
-
-	db, err := GetDB(context.Background())
-	require.NoError(t, err)
+	mock.ExpectBegin()
+	mock.ExpectQuery("INSERT (.+)").WillReturnRows(sqlmock.NewRows([]string{"id"}).FromCSVString("1")) //.WillReturnResult(sqlmock.NewResult(1, 1)) //.WithArgs("firstname", "lastname")
+	mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
+	expectGridOperatorLookup(mock)
+	mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 
 	err = db.RegisterParticipant(context.Background(), "RC200200", "petero", &p)
 	assert.NoError(t, err)
@@ -130,8 +127,7 @@ func TestEnforceAddressTypes(t *testing.T) {
 // With an empty meter list saveMeteringPoint returns before issuing SQL, so the
 // statement order is exactly participant, contactdetail, bankaccount, address.
 func TestRegisterParticipantStampsResidenceType(t *testing.T) {
-	mockDb, err := GetMockDb()
-	require.NoError(t, err)
+	db, mock := newMockDatabase(t)
 
 	participantJson := `{"businessRole":"EEG_PRIVATE","firstname":"Anna","lastname":"Berger","contact":{"email":"anna.berger@example.at"},"accountInfo":{},"optionals":{},"status":"NEW","role":"EEG_USER","billingAddress":{"street":"Hauptstrasse","streetNumber":"1","zip":"1010","city":"Wien","type":"BILLING"},"meters":[]}`
 
@@ -139,27 +135,20 @@ func TestRegisterParticipantStampsResidenceType(t *testing.T) {
 	require.NoError(t, json.NewDecoder(strings.NewReader(participantJson)).Decode(&p))
 	require.Empty(t, p.ResidentAddress.Type, "fixture must not carry a resident type")
 
-	mockDb.Mock.ExpectBegin()
-	mockDb.Mock.ExpectQuery("INSERT (.+)").WillReturnRows(sqlmock.NewRows([]string{"id"}).FromCSVString("1"))
-	mockDb.Mock.ExpectExec(`INSERT INTO "base"\."contactdetail"`).WillReturnResult(sqlmock.NewResult(1, 1))
-	mockDb.Mock.ExpectExec(`INSERT INTO "base"\."bankaccount"`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectBegin()
+	mock.ExpectQuery("INSERT (.+)").WillReturnRows(sqlmock.NewRows([]string{"id"}).FromCSVString("1"))
+	mock.ExpectExec(`INSERT INTO "base"\."contactdetail"`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO "base"\."bankaccount"`).WillReturnResult(sqlmock.NewResult(1, 1))
 	// both tuples in order: without the fix the second one carries an empty type
-	mockDb.Mock.ExpectExec(`INSERT INTO "base"\."address" .*'BILLING'.*'RESIDENCE'`).WillReturnResult(sqlmock.NewResult(1, 1))
-	mockDb.Mock.ExpectCommit()
-
-	db, err := GetDB(context.Background())
-	require.NoError(t, err)
+	mock.ExpectExec(`INSERT INTO "base"\."address" .*'BILLING'.*'RESIDENCE'`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, db.RegisterParticipant(context.Background(), "RC200200", "annab", &p))
-	assert.NoError(t, mockDb.Mock.ExpectationsWereMet())
+	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestGetParticipant(t *testing.T) {
-	mockDb, err := GetMockDb()
-	require.NoError(t, err)
-
-	db, err := GetDB(context.Background())
-	require.NoError(t, err)
+	db, mock := newMockDatabase(t)
 
 	participantRows := sqlmock.NewRows([]string{
 		"id", "firstname", "lastname", "role", "businessRole", "titleBefore", "titleAfter", "participantSince",
@@ -168,29 +157,29 @@ func TestGetParticipant(t *testing.T) {
 		AddRow(uuid.New(), "Sepp", "Huber", "EEG_USER", "EEG_PRIVATE", "", "", time.Now(),
 			"", "", "", "NEW", "admin", //time.Now(), "petero", time.Now(),
 			1, uuid.New(), "001")
-	mockDb.Mock.ExpectQuery("SELECT (.+) FROM \"base\".\"participant\" (.+)").WillReturnRows(participantRows)
+	mock.ExpectQuery("SELECT (.+) FROM \"base\".\"participant\" (.+)").WillReturnRows(participantRows)
 
 	//contactDetailsRows := sqlmock.NewRows([]string{"email", "phone"}).AddRow("mail@test.com", "+4325622 232311 32323")
-	//mockDb.Mock.ExpectQuery("SELECT (.+) FROM \"base\".\"contactdetail\" (.+)").WillReturnRows(contactDetailsRows)
+	//mock.ExpectQuery("SELECT (.+) FROM \"base\".\"contactdetail\" (.+)").WillReturnRows(contactDetailsRows)
 	//
 	//bankaccountRows := sqlmock.NewRows([]string{"iban", "owner"}).AddRow("AT12 3456 7987 9887 7765", "Sepp Huber")
-	//mockDb.Mock.ExpectQuery("SELECT (.+) FROM \"base\".\"bankaccount\" (.+)").WillReturnRows(bankaccountRows)
+	//mock.ExpectQuery("SELECT (.+) FROM \"base\".\"bankaccount\" (.+)").WillReturnRows(bankaccountRows)
 	//
 	//addressRows := sqlmock.NewRows([]string{"city", "street", "streetNumber", "type", "zip"}).
 	//	AddRow("Solarcity", "Energieweg", "12a", "BILLING", "1234")
-	//mockDb.Mock.ExpectQuery("SELECT (.+) FROM \"base\".\"address\" (.+)").WillReturnRows(addressRows)
+	//mock.ExpectQuery("SELECT (.+) FROM \"base\".\"address\" (.+)").WillReturnRows(addressRows)
 	//
 	//addressResidenceRows := sqlmock.NewRows([]string{"city", "street", "streetNumber", "type", "zip"}).
 	//	AddRow("Solarcity", "Energieweg", "12a", "RESIDENCE", "1234")
-	//mockDb.Mock.ExpectQuery("SELECT (.+) FROM \"base\".\"address\" (.+)").WillReturnRows(addressResidenceRows)
+	//mock.ExpectQuery("SELECT (.+) FROM \"base\".\"address\" (.+)").WillReturnRows(addressResidenceRows)
 	//
 	meterRows := sqlmock.NewRows([]string{"city", "direction", "equipmentName", "equipmentNumber", "inverterid", "metering_point_id",
 		"modifiedAt", "modifiedBy", "registeredSince", "status", "street", "streetNumber", "tariff_id", "transformer", "zip"}).
 		AddRow("Solarcity", "GENERATOR", "", "", "", "AT0020001110000010011111001",
 			time.Now(), "admin", time.Now(), "NEW", "Energieweg", "12a", uuid.New(), "", "1234")
-	//mockDb.Mock.ExpectQuery("SELECT (.+) FROM \"base\".\"participant_meter_state\" (.+)").WillReturnRows(meterRows)
+	//mock.ExpectQuery("SELECT (.+) FROM \"base\".\"participant_meter_state\" (.+)").WillReturnRows(meterRows)
 
-	mockDb.Mock.ExpectQuery("SELECT (.+) FROM \"base\".\"meteringpoint\", (.+)").WillReturnRows(meterRows)
+	mock.ExpectQuery("SELECT (.+) FROM \"base\".\"meteringpoint\", (.+)").WillReturnRows(meterRows)
 
 	participants, err := db.GetParticipants(context.Background(), "RC100298")
 	assert.NoError(t, err)
@@ -200,9 +189,6 @@ func TestGetParticipant(t *testing.T) {
 }
 
 func Test_GetParticipants(t *testing.T) {
-	//_, err := GetMockDb()
-	//require.NoError(t, err)
-
 	db, err := GetTestDB(context.Background(), testDB)
 	require.NoError(t, err)
 
@@ -287,6 +273,7 @@ func Test_saveParticipant(t *testing.T) {
 	mock.ExpectExec("INSERT (.+) \"base\".\"contactdetail\"").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("INSERT (.+) \"base\".\"bankaccount\"").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("INSERT (.+) \"base\".\"address\"").WillReturnResult(sqlmock.NewResult(1, 1))
+	expectGridOperatorLookup(mock)
 	mock.ExpectExec("INSERT (.+) \"base\".\"meteringpoint\"").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("INSERT (.+) \"base\".\"metering_partition_factor\"").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
@@ -746,4 +733,42 @@ func TestUpdateParticipantPartial(t *testing.T) {
 			tt.test(t, p)
 		})
 	}
+}
+
+// TestUpdateParticipantRejectsForeignTenant deckt F4 ab: der volle Update-Pfad
+// darf die Kindtabellen (Kontakt, Adressen, Bankkonto) eines fremden Teilnehmers
+// nicht ueberschreiben. Frueher trug nur das Haupt-UPDATE den tenant im WHERE,
+// die Kindtabellen liefen allein ueber participant_id.
+func TestUpdateParticipantRejectsForeignTenant(t *testing.T) {
+	const (
+		ownTenant     = "TE000001"
+		foreignTenant = "TE000004"
+		participantId = "ea9942da-03da-11ee-b82b-5a985b4b033a"
+	)
+	db, err := GetDB(context.Background())
+	require.NoError(t, err)
+
+	before, err := db.GetParticipant(context.Background(), ownTenant, participantId)
+	require.NoError(t, err)
+
+	foreign := &model.EegParticipant{
+		EegParticipantBase: model.EegParticipantBase{
+			Id:        uuid.Parse(participantId),
+			FirstName: "HIJACKED",
+		},
+		Contact:         model.ContactInfo{Phone: null.StringFrom("6666"), Email: null.StringFrom("attacker@example.org")},
+		BillingAddress:  model.Address{Type: "BILLING", City: null.StringFrom("HIJACKED")},
+		ResidentAddress: model.Address{Type: "RESIDENCE"},
+		BankAccount:     model.BankInfo{Iban: null.StringFrom("AT000000000000000000"), Owner: null.StringFrom("HIJACKED")},
+	}
+
+	err = db.UpdateParticipant(context.Background(), foreignTenant, "attacker", foreign)
+	assert.Error(t, err, "update aus fremdem Mandanten muss abgewiesen werden")
+
+	after, err := db.GetParticipant(context.Background(), ownTenant, participantId)
+	require.NoError(t, err)
+	assert.Equal(t, before.Contact.Phone, after.Contact.Phone, "Kontakt-Telefon darf nicht veraendert sein")
+	assert.Equal(t, before.Contact.Email, after.Contact.Email, "Kontakt-E-Mail darf nicht veraendert sein")
+	assert.Equal(t, before.BankAccount.Iban, after.BankAccount.Iban, "IBAN darf nicht veraendert sein")
+	assert.Equal(t, before.BillingAddress.City, after.BillingAddress.City, "Rechnungsadresse darf nicht veraendert sein")
 }

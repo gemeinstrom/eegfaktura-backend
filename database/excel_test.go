@@ -1,12 +1,14 @@
 package database
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,15 +27,15 @@ func Test_transformExcelData(t *testing.T) {
 	require.NoError(t, err)
 	defer reader.Close()
 
-	f, err := openReader(reader, "TE100200-Muster-Stammdatenimport.xlsx")
+	f, cleanup, err := openReader(reader, "TE100200-Muster-Stammdatenimport.xlsx")
 	require.NoError(t, err)
-	defer f.Close()
+	defer cleanup()
 
 	rows, err := f.Rows("EEG Stammdaten")
 	require.NoError(t, err)
 
 	importLog := &model.Log{Operation: "Excel Master Data Import", Messages: []*model.LogMessage{}}
-	participants := transformExcelData(rows, func(id string) string { return id }, false, "AT00999900000TC100200000000000002", importLog)
+	participants := transformExcelData(context.Background(), rows, func(id string) string { return id }, false, "AT00999900000TC100200000000000002", importLog)
 
 	findParticipant := func(n string, p []*model.EegParticipant) *model.EegParticipant {
 		for i := range p {
@@ -46,13 +48,16 @@ func Test_transformExcelData(t *testing.T) {
 
 	assert.Equal(t, 7, len(participants))
 	assert.Equal(t, 2, len(findParticipant("Finnegan", participants).MeteringPoint))
-	assert.Equal(t, null.StringFrom("001-3456"), findParticipant("Finnegan", participants).TaxNumber)
+	// the template still has the column SteuerNr, the import leaves it out
+	assert.False(t, findParticipant("Finnegan", participants).TaxNumber.Valid)
 
 	assert.Equal(t, null.StringFrom("003"), findParticipant("Finnegan", participants).ParticipantNumber)
 	assert.Equal(t, null.StringFrom("005"), findParticipant("Beckett", participants).ParticipantNumber)
 	assert.Equal(t, null.StringFrom("Silvia.Beckett@eegfaktura.at"), findParticipant("Beckett", participants).Contact.Email)
-	assert.Equal(t, null.StringFrom("AT009999"), findParticipant("Beckett", participants).MeteringPoint[0].GridOperatorId)
-	assert.Equal(t, null.StringFrom("AT009999"), findParticipant("Beckett", participants).MeteringPoint[0].GridOperatorName)
+	// platform#107: the grid operator comes from the metering point number, not from column A
+	beckettMeter := findParticipant("Beckett", participants).MeteringPoint[0]
+	assert.Equal(t, null.StringFrom(beckettMeter.MeteringPoint[:8]), beckettMeter.GridOperatorId)
+	assert.Equal(t, null.StringFrom(beckettMeter.MeteringPoint[:8]), beckettMeter.GridOperatorName)
 
 }
 
@@ -126,65 +131,6 @@ func TestImportMasterdataFromExcel(t *testing.T) {
 	}
 }
 
-//func TestImportMasterdataFromExcel(t *testing.T) {
-//	var mockDb, err = GetDatabaseMock()
-//	require.NoError(t, err)
-//
-//	reader, err := os.Open("../tests/TE100200-Muster-Stammdatenimport.xlsx")
-//	require.NoError(t, err)
-//	defer reader.Close()
-//
-//	type args struct {
-//		dbConn   OpenDbXConnection
-//		r        io.Reader
-//		filename string
-//		sheet    string
-//		tenant   string
-//	}
-//	tests := []struct {
-//		name    string
-//		args    args
-//		prepare func()
-//		test    func(t *testing.T, args args)
-//	}{
-//		{
-//			name: "import file",
-//			args: args{
-//				dbConn:   mockDb.OpenMockDb,
-//				r:        reader,
-//				filename: "TE100200-Muster-Stammdatenimport.xlsx",
-//				sheet:    "EEG Stammdaten",
-//				tenant:   "TE100200",
-//			},
-//			prepare: func() {
-//
-//			},
-//			test: func(t *testing.T, args args) {
-//				require.NoError(t, err)
-//				//mockDb.mock.ExpectExec("^INSERT INTO (.+) VALUES (.+)") //.WithArgs("firstname", "lastname")
-//				//mockDb.Mock.ExpectQuery("^SELECT (.+)").WillReturnError(sql.ErrNoRows)
-//				mockDb.Mock.ExpectBegin()
-//				// , 'excel', 'Mustermann', '001', '2023-08-19T13:15:07.776003233Z', 'ACTIVE', '001-9876', 'TE100200', '', '', '', DEFAULT
-//				mockDb.Mock.ExpectQuery("INSERT (.+)").WillReturnRows(sqlmock.NewRows([]string{"id"}).FromCSVString("1")) //.WillReturnResult(sqlmock.NewResult(1, 1)) //.WithArgs("firstname", "lastname")
-//				mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-//				mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-//				mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-//				mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-//				//mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-//				//mockDb.Mock.ExpectExec("INSERT (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-//
-//				require.NoError(t, ImportMasterdataFromExcel(args.dbConn, args.r, args.filename, args.sheet, args.tenant))
-//				//require.NoError(t, mockDb.Mock.ExpectationsWereMet())
-//			},
-//		},
-//	}
-//	for _, tt := range tests {
-//		t.Run(tt.name, func(t *testing.T) {
-//			tt.test(t, tt.args)
-//		})
-//	}
-//}
-
 func TestExportMasterdataToExcel(t *testing.T) {
 	db, err := GetDB(context.Background())
 	require.NoError(t, err)
@@ -196,7 +142,7 @@ func TestExportMasterdataToExcel(t *testing.T) {
 	participants, err := db.GetParticipants(context.Background(), tenant)
 	require.NoError(t, err)
 
-	tariffMap, err := db.GetTariffNameMap(tenant)
+	tariffMap, err := db.GetTariffNameMap(context.Background(), tenant)
 	require.NoError(t, err)
 
 	type args struct {
@@ -215,8 +161,9 @@ func TestExportMasterdataToExcel(t *testing.T) {
 			args: args{participants: participants, eeg: eeg, tariffMap: tariffMap},
 			check: func(t *testing.T, buff *bytes.Buffer) {
 				r := bytes.NewReader(buff.Bytes())
-				f, err := openReader(r, "test")
+				f, cleanup, err := openReader(r, "test")
 				require.NoError(t, err)
+				defer cleanup()
 
 				rows, err := f.Rows("Mitglieder")
 				require.NoError(t, err)
@@ -231,14 +178,31 @@ func TestExportMasterdataToExcel(t *testing.T) {
 				}
 
 				assert.Equal(t, 6, len(cols))
-				assert.Equal(t, "6", cols[1][19])
+				assert.Equal(t, "6", cols[1][18])
+
+				// platform#165: both Status columns (E, W) show the member status derived from the metering points
+				for _, row := range cols[1:] {
+					assert.Contains(t, []string{"aktiv", "in Anmeldung", "inaktiv"}, row[4])
+					assert.Equal(t, row[4], row[22])
+				}
+
+				// the filter covers every header column and all rows (was A1:AH10)
+				lastCell, err := excelize.CoordinatesToCellName(len(cols[0]), len(cols), true)
+				require.NoError(t, err)
+				var filter string
+				for _, n := range f.GetDefinedName() {
+					if n.Name == "_xlnm._FilterDatabase" {
+						filter = n.RefersTo
+					}
+				}
+				assert.True(t, strings.HasSuffix(filter, "!$A$1:"+lastCell), "filter %q, want …!$A$1:%s", filter, lastCell)
 			},
 			wantErr: assert.NoError,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ExportMasterdataToExcel(tt.args.participants, tt.args.eeg, tt.args.tariffMap)
+			got, err := ExportMasterdataToExcel(context.Background(), tt.args.participants, tt.args.eeg, tt.args.tariffMap, nil, nil)
 			if !tt.wantErr(t, err, fmt.Sprintf("ExportMasterdataToExcel(%v, %v, %v)", tt.args.participants, tt.args.eeg, tt.args.tariffMap)) {
 				return
 			}
@@ -254,7 +218,112 @@ func TestExportZPListToExcel(t *testing.T) {
 	err := json.Unmarshal([]byte(testMsg), &ebmsMsgTest)
 	require.NoError(t, err)
 
-	buf, err := ExportZPListToExcel(&ebmsMsgTest)
-	err = os.WriteFile("./test.xlsx", buf.Bytes(), 0644)
+	buf, err := ExportZPListToExcel(context.Background(), &ebmsMsgTest)
 	require.NoError(t, err)
+
+	f, err := excelize.OpenReader(buf)
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+	assert.Equal(t, []string{"ZP-List"}, f.GetSheetList())
+	rows, err := f.GetRows("ZP-List")
+	require.NoError(t, err)
+	require.Len(t, rows, 1+len(ebmsMsgTest.MeterList), "header and one row per metering point")
+	assert.Equal(t, "Zählpunktname", rows[0][1])
+	assert.Equal(t, ebmsMsgTest.MeterList[0].MeteringPoint, rows[1][1])
+	assert.Equal(t, ebmsMsgTest.MeterList[len(ebmsMsgTest.MeterList)-1].MeteringPoint, rows[len(rows)-1][1])
+}
+
+// withTempDir points the process temp directory to an empty test directory.
+func withTempDir(t *testing.T) string {
+	dir := t.TempDir()
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
+	t.Setenv("TMPDIR", dir)
+	require.Equal(t, dir, os.TempDir())
+	return dir
+}
+
+func requireEmptyDir(t *testing.T, dir string) {
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
+func Test_openReader_rejectsOversizedWorkbook(t *testing.T) {
+	// A workbook part whose declared unzipped size exceeds the limit must be rejected
+	// before it is extracted.
+	dir := withTempDir(t)
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	_, err := zw.CreateRaw(&zip.FileHeader{
+		Name:               "xl/worksheets/sheet1.xml",
+		Method:             zip.Store,
+		UncompressedSize64: excelUnzipSizeLimit + 1,
+	})
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+
+	_, _, err = openReader(bytes.NewReader(buf.Bytes()), "oversized.xlsx")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unzip size exceeds")
+	requireEmptyDir(t, dir)
+}
+
+func Test_openReader_rejectsWorkbookExceedingTotalLimit(t *testing.T) {
+	// Each entry is below the limit, together they exceed it. The two worksheets are above
+	// the in-memory limit, so excelize unzips them to temp files before the last entry
+	// (only declared, no data) pushes the total over the limit.
+	dir := withTempDir(t)
+	const sheetSize = excelUnzipXMLSizeLimit + 4<<20
+	chunk := bytes.Repeat([]byte("<row/>"), 1<<16)
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for i := 1; i <= 2; i++ {
+		w, err := zw.Create(fmt.Sprintf("xl/worksheets/sheet%d.xml", i))
+		require.NoError(t, err)
+		for written := 0; written < sheetSize; written += len(chunk) {
+			_, err = w.Write(chunk)
+			require.NoError(t, err)
+		}
+	}
+	_, err := zw.CreateRaw(&zip.FileHeader{
+		Name:               "xl/media/image1.png",
+		Method:             zip.Store,
+		UncompressedSize64: excelUnzipSizeLimit - 2*sheetSize + 1<<20,
+	})
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+
+	_, _, err = openReader(bytes.NewReader(buf.Bytes()), "oversized.xlsx")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unzip size exceeds")
+	requireEmptyDir(t, dir)
+}
+
+func Test_openReader_cleanupRemovesTempDir(t *testing.T) {
+	dir := withTempDir(t)
+	reader, err := os.Open("../tests/TE100200-Muster-Stammdatenimport.xlsx")
+	require.NoError(t, err)
+	defer reader.Close()
+
+	f, cleanup, err := openReader(reader, "TE100200-Muster-Stammdatenimport.xlsx")
+	require.NoError(t, err)
+	_, err = f.GetRows("EEG Stammdaten")
+	require.NoError(t, err)
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	cleanup()
+	requireEmptyDir(t, dir)
+}
+
+type panicReader struct{}
+
+func (panicReader) Read([]byte) (int, error) { panic("read failed") }
+
+func Test_openReader_panicRemovesTempDir(t *testing.T) {
+	dir := withTempDir(t)
+	require.Panics(t, func() { _, _, _ = openReader(panicReader{}, "panic.xlsx") })
+	requireEmptyDir(t, dir)
 }

@@ -19,7 +19,6 @@ func InitApiRouter(r *mux.Router, db database.Database) *mux.Router {
 
 	s.HandleFunc("/updatepartfact", middleware.ProtectApi(h.updateParticipantFactorAPI())).Methods("POST")
 	s.HandleFunc("/masterdata", middleware.ProtectApi(h.fetchMasterDataAPI())).Methods("GET")
-	s.HandleFunc("/test", h.testApi).Methods("GET")
 	return r
 }
 
@@ -31,11 +30,6 @@ func NewApiHandler(db database.Database) *ApiHandler {
 	return &ApiHandler{db: db}
 }
 
-func (h *ApiHandler) testApi(w http.ResponseWriter, r *http.Request) {
-	println("TestApi")
-	return
-}
-
 func (h *ApiHandler) updateParticipantFactorAPI() middleware.JWTHandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request, claims *middleware.PlatformClaims, tenant string) {
 		var request struct {
@@ -44,30 +38,36 @@ func (h *ApiHandler) updateParticipantFactorAPI() middleware.JWTHandlerFunc {
 
 		err := json.NewDecoder(r.Body).Decode(&request)
 		if err != nil {
-			log.WithField("tenant", tenant).WithError(err).Error("failed to request metering point PRTFACT")
-			respondWith(w, http.StatusBadRequest, tenant, model.ErrParseJson(err))
+			log.WithContext(r.Context()).WithField("tenant", tenant).WithError(err).Error("failed to request metering point PRTFACT")
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrParseJson(err))
 			return
 		}
 
 		if request.MeteringPoints == nil || len(request.MeteringPoints) == 0 {
-			log.WithField("tenant", tenant).WithError(err).Error("failed to request metering point PRTFACT")
+			log.WithContext(r.Context()).WithField("tenant", tenant).WithError(err).Error("failed to request metering point PRTFACT")
 			respondWithError(w, http.StatusBadRequest, "failed to request metering point PRTFACT")
+			return
+		}
+
+		if err = assertPartitionFactorMeters(r.Context(), h.db, tenant, request.MeteringPoints); err != nil {
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, err)
 			return
 		}
 
 		eeg, err := h.db.GetEegById(r.Context(), tenant)
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, model.ErrGetEeg(err))
 			return
 		}
 
 		if eeg.Online {
 			if err = mqttclient.ChangePartitionFactor(eeg, request.MeteringPoints); err != nil {
-				log.WithField("tenant", tenant).WithError(err).Errorf("failed to request metering point PRTFACT. Err: %v", request)
-				respondWith(w, http.StatusInternalServerError, tenant, err)
+				log.WithContext(r.Context()).WithField("tenant", tenant).WithError(err).Errorf("failed to request metering point PRTFACT for %d metering point(s)", len(request.MeteringPoints))
+				respondWith(r.Context(), w, http.StatusInternalServerError, tenant, err)
+				return
 			}
 		} else {
-			log.WithField("tenant", tenant).Warnf("Offline EEG want to change partitions of %+v", request)
+			log.WithContext(r.Context()).WithField("tenant", tenant).Warnf("Offline EEG want to change partitions of %d metering point(s)", len(request.MeteringPoints))
 			respondWithStatus(w, http.StatusNotFound)
 			return
 		}
@@ -80,7 +80,7 @@ func (h *ApiHandler) fetchMasterDataAPI() middleware.JWTHandlerFunc {
 
 		participants, err := h.db.GetParticipants(r.Context(), tenant)
 		if err != nil {
-			respondWith(w, http.StatusBadRequest, tenant, err)
+			respondWith(r.Context(), w, http.StatusBadRequest, tenant, err)
 			return
 		}
 

@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 
 	"at.ourproject/vfeeg-backend/database"
 	"at.ourproject/vfeeg-backend/model"
@@ -11,6 +12,14 @@ import (
 	"google.golang.org/grpc/status"
 	"gopkg.in/guregu/null.v4"
 )
+
+// statusEegExists in RegisteredEegReply.status: the tenant is already registered, nothing was written.
+// admin-backend stops the registration on it (261015-ca1).
+const statusEegExists = 409
+
+// statusInvalidEeg in RegisteredEegReply.status: a value is unknown (e.g. an enum value this backend does not know
+// yet, its name is the number), nothing was written. Without a gRPC error, like 409 (platform#229).
+const statusInvalidEeg = 400
 
 type RegisterService struct {
 	protobuf.UnimplementedRegisterEegServiceServer
@@ -62,14 +71,40 @@ func (r *RegisterService) Register(ctx context.Context, eeg *protobuf.RegisterEe
 		ContactPerson: null.StringFrom(eeg.EegOwner),
 	}
 
-	log.Printf("Register EEG: %+v", newEeg)
+	// An allocation, settlement interval or legal form this backend does not know arrived as its number and was
+	// stored: refused.
+	if !knownEnum(protobuf.RegisterEegRequest_GRID_ALLOCATION_name, int32(eeg.Allocation)) ||
+		!knownEnum(protobuf.RegisterEegRequest_EEG_SETTELMENT_name, int32(eeg.SettelmentInterval)) ||
+		!knownEnum(protobuf.RegisterEegRequest_EEG_LEGAL_name, int32(eeg.Legal)) {
+		log.WithField("event.action", "eeg.register.refused").Warnf("Register EEG refused: unknown allocation %d, settlement interval %d or legal form %d",
+			eeg.Allocation, eeg.SettelmentInterval, eeg.Legal)
+		return &protobuf.RegisteredEegReply{Status: statusInvalidEeg}, nil
+	}
+
+	log.Printf("Register EEG: %s", newEeg.Id)
 	db, err := database.GetDB(ctx)
 	if err != nil {
 		log.Errorf("Database Error: %v", err)
 		return &protobuf.RegisteredEegReply{Status: 500}, err
 	}
 
-	err = db.InsertEeg(ctx, eeg.RcNumber, &newEeg)
+	return registerReply(db.InsertEeg(ctx, eeg.RcNumber, &newEeg))
+}
+
+func knownEnum(names map[int32]string, v int32) bool {
+	_, ok := names[v]
+	return ok
+}
+
+func registerReply(err error) (*protobuf.RegisteredEegReply, error) {
+	if errors.Is(err, database.ErrEegExists) {
+		log.Warn("Register EEG refused: the tenant is already registered")
+		return &protobuf.RegisteredEegReply{Status: statusEegExists}, nil
+	}
+	if errors.Is(err, database.ErrInvalidEeg) {
+		log.WithField("event.action", "eeg.register.refused").Warnf("Register EEG refused: %v", err)
+		return &protobuf.RegisteredEegReply{Status: statusInvalidEeg}, nil
+	}
 	if err != nil {
 		log.Errorf("Could not create an EEG! %v", err.Error())
 		return &protobuf.RegisteredEegReply{Status: 500},

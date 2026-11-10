@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jjeffery/civil"
+	"slices"
 	"time"
 )
 
@@ -57,32 +58,45 @@ func extractResponseCodeAndMeteringPointV2(ebmsMessage *model.EbmsMessage) ([]re
 		}
 		return &id
 	}
+	// fromMeterElement is the metering point of the <meter> element with the given codes
+	fromMeterElement := func(codes []int16) []responseCodesPerMeter {
+		return []responseCodesPerMeter{{
+			meter:      ebmsMessage.Meter.MeteringPoint,
+			codes:      codes,
+			consentEnd: civil.DateOf(time.UnixMilli(ebmsMessage.ConsentEnd)),
+			consentId:  consentId(ebmsMessage.Meter.ConsentID),
+		}}
+	}
 
 	switch ebmsMessage.MessageCode {
 	case model.EBMS_AUFHEBUNG_CCMS, model.EBMS_ABLEHNUNG_CCMS:
-		if ebmsMessage.Meter != nil {
+		// only the echo of the community's own request gets the synthetic 99
+		if ebmsMessage.MessageCode == model.EBMS_AUFHEBUNG_CCMS && ebmsMessage.Meter != nil {
 			codes = append(codes, 99)
-			response = []responseCodesPerMeter{{
-				meter:      ebmsMessage.Meter.MeteringPoint,
-				codes:      []int16{99},
-				consentEnd: civil.DateOf(time.UnixMilli(ebmsMessage.ConsentEnd)),
-				consentId:  consentId(ebmsMessage.Meter.ConsentID),
-			}}
+			response = fromMeterElement([]int16{99})
 		} else {
-			// A rejection (ABLEHNUNG_CCMS) carries no <meter> element; the metering
-			// point and reason codes arrive via ResponseData instead. Build from
-			// there so the rejection can still be recorded (and to avoid a
-			// nil-pointer dereference on ebmsMessage.Meter).
+			// A rejection (ABLEHNUNG_CCMS) carries the metering point and reason codes in ResponseData; build from
+			// there so the rejection can still be recorded (and to avoid a nil-pointer dereference on
+			// ebmsMessage.Meter). A <meter> element only stands in for a metering point missing there; its codes
+			// are never the reason (platform#238).
 			for _, rd := range ebmsMessage.ResponseData {
 				if len(rd.ResponseCode) > 0 {
 					codes = append(codes, rd.ResponseCode...)
 				}
+				meter := rd.MeteringPoint
+				if meter == "" && ebmsMessage.Meter != nil {
+					meter = ebmsMessage.Meter.MeteringPoint
+				}
 				response = append(response, responseCodesPerMeter{
-					meter:      rd.MeteringPoint,
+					meter:      meter,
 					codes:      rd.ResponseCode,
 					consentEnd: civil.DateOf(time.UnixMilli(rd.ConsentEnd)),
 					consentId:  consentId(rd.ConsentId),
 				})
+			}
+			// no ResponseData: the metering point without a reason, so the status stays and the rejection is recorded
+			if len(response) == 0 && ebmsMessage.Meter != nil {
+				response = fromMeterElement([]int16{})
 			}
 		}
 	default:
@@ -117,6 +131,20 @@ func extractMeterList(ebmsMessage *model.EbmsMessage) []*completionMeters {
 
 func codesContains(expected, codes []int16) bool {
 	return len(intersectCodes(expected, codes)) > 0
+}
+
+// rejectionCode picks the code stored for an ABLEHNUNG: the first candidate as before, but when it is
+// one of model.REJECTED_KEEP_ACTIVE_CODES and another candidate concerns the metering point itself,
+// that one wins. The DAO keeps an ACTIVE metering point ACTIVE by the stored code, so this holds only
+// when all candidate codes concern the request. Candidates are the codes the old logic considered
+// (INVALID: the REJECTED_INVALID_CODES intersection, REJECTED: all codes), so web keeps a known reason.
+func rejectionCode(candidates []int16) int16 {
+	for _, c := range candidates {
+		if !slices.Contains(model.REJECTED_KEEP_ACTIVE_CODES, c) {
+			return c
+		}
+	}
+	return candidates[0]
 }
 
 func intersectCodes(expected, codes []int16) []int16 {

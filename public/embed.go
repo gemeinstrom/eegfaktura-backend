@@ -1,10 +1,9 @@
 // Package public embeds the default mail templates that ship in the binary.
 //
-// They are the last-resort source for mail rendering: at runtime the data
-// volume overrides them (see parser.resolveTemplateSource) — a per-tenant
-// templates dir first, then the global one. The embed guarantees a working
-// default, so a fresh deployment renders the activation and completion mails
-// without any template being seeded onto the PVC.
+// They are the built-in default of the member mails: a community without a
+// saved version (base.mail_template) gets these. Hand-made templates on the
+// data volume are no longer read (see parser.embeddedTemplates); the embed
+// lets a fresh deployment send the mails without anything on the PVC.
 package public
 
 import "embed"

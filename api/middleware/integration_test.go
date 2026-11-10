@@ -2,23 +2,13 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
-
-func TestMain(m *testing.M) {
-	err := os.Setenv("KEYCLOAK_CONFIG", "../../keycloak.json")
-	if err != nil {
-		panic(err)
-	}
-	InitKeycloak()
-	code := m.Run()
-	os.Exit(code)
-}
 
 func TestProtectMiddleware_ValidToken_AllowsRequest(t *testing.T) {
 	orig := VerifyTokenClaims
@@ -111,7 +101,31 @@ func TestConditionProtect_RoutesToAdminOrUser(t *testing.T) {
 			}(struct{ Roles []string }{Roles: []string{}}),
 		}, nil
 	}
+	adminCalled = false
 	rw2 := httptest.NewRecorder()
 	h(rw2, req)
 	require.True(t, userCalled)
+	require.False(t, adminCalled)
+}
+
+func TestGQLProtect_InvalidToken_DoesNotLeakVerifierError(t *testing.T) {
+	orig := VerifyTokenClaims
+	defer func() { VerifyTokenClaims = orig }()
+
+	const verifierErr = "oidc: id token signed with unsupported algorithm, expected [\"RS256\"] got \"HS256\""
+	VerifyTokenClaims = func(ctx context.Context, token string) (*PlatformClaims, error) {
+		return nil, errors.New(verifierErr)
+	}
+
+	req := httptest.NewRequest("POST", "/query", nil)
+	req.Header.Set("Authorization", BEARER_SCHEMA+"token")
+	req.Header.Set("tenant", "TE100100")
+
+	rw := httptest.NewRecorder()
+	GQLProtect(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(rw, req)
+
+	require.Equal(t, http.StatusUnauthorized, rw.Code)
+	require.Empty(t, rw.Body.String())
 }
